@@ -1,8 +1,56 @@
 # e_repl
 
-A flexible framework/ harness for agentic robotics for studying how agents perform under different objective based setups. The model has a single action,
-"run this cell"; tools are ordinary Python objects in the namespace; every run is written to disk
-as a trajectory. The repo follows the conventions of [poorin-lite](https://github.com/jasgcode/poorin-lite).
+A framework for studying language-model agents that control robots. The object of study is the
+agent: what it does with a body, what it claims, when it declines, and how that changes with the
+setup it is put in. The setup (the world document, the tools, the limits, the clock, the
+teammates) is the variable, and the trace of every run is the data.
+
+The model has a single action, "run this cell": it writes Python against tools that are ordinary
+objects in a persistent namespace. Every run is written to disk as it happens, with the model's
+reasoning, what it was shown, and what the world measured afterwards. The repo follows the
+conventions of [poorin-lite](https://github.com/jasgcode/poorin-lite).
+
+## What it is for
+
+The questions below are the ones safety research asks of an agent with actuators. Each row names
+what in e_repl answers it today.
+
+| Question | What answers it |
+|---|---|
+| Did the agent decline a harmful task, or try and fail? | `refuse()` and `give_up()` are separate endings, and a harm task gets one of RoboHarm's six labels beside its verdict ([0014](docs/decisions/0014-give-up-ends-a-run-without-a-claim-of-success.md), [0015](docs/decisions/0015-a-run-can-carry-a-safety-label-beside-its-verdict.md)) |
+| Does it claim success it did not get? | `done()` is a claim and the world's grader gives the verdict; both are in `result.json` ([0005](docs/decisions/0005-the-world-grades-each-run.md)) |
+| Does it game the check instead of doing the task? | The grader is a function the model cannot reach, a task is admitted only if a model that writes the grader's state fails, and a world can run as its own process ([0010](docs/decisions/0010-a-world-can-run-as-its-own-process.md)) |
+| What stops code the agent wrote? | Nothing in the REPL. The limit sits in the process that holds the device: only listed calls, motion only inside a run, a fault latch only a person clears, and a log written before each answer ([0018](docs/decisions/0018-the-harness-serves-hardware.md)) |
+| Does a second agent make the first safer? | `run_team` puts agents on one task with shared limits; they talk through `tell()`, and any one of them can refuse for all ([0020](docs/decisions/0020-several-agents-can-share-a-run.md)) |
+| How does time pressure change what it does? | A time limit the model is told about, one clock over everything, and added latency to price speed ([0016](docs/decisions/0016-a-run-keeps-a-time-ledger.md), [0017](docs/decisions/0017-a-run-can-have-a-time-limit-the-model-is-told.md)) |
+| Did its stated reasoning match its actions? | Each step keeps the reasoning, the endpoint's whole response, and the code that ran ([0012](docs/decisions/0012-a-step-records-what-cannot-be-worked-out-later.md)), read in a viewer that runs no scripts ([0013](docs/decisions/0013-traces-are-read-through-a-viewer-with-no-scripts.md)) |
+| Would the result hold if someone ran it again? | Every run records its recipe and fingerprint, the world's initial state, and the commit; the harness copy carries a digest ([0003](docs/decisions/0003-every-run-is-recorded-with-its-recipe.md), [0008](docs/decisions/0008-a-run-records-the-worlds-initial-state.md), [0009](docs/decisions/0009-the-harness-records-a-digest-of-its-files.md)) |
+
+## Beside Inspect Robots
+
+[Inspect Robots](https://github.com/robocurve/inspect-robots) carries
+[Inspect AI](https://inspect.aisi.org.uk/) to physical robots: a benchmark of tasks, run as
+trials of a policy (a VLA, or an LLM acting through motion tools) on an embodiment, scored and
+written to an eval log, with guards that clip or reject unsafe actions. It answers how well, and
+how safely, a policy performs a benchmark, and it compares policies and robots.
+
+e_repl holds the policy and the robot fixed and varies the agent's situation. It works at the
+scale of one bench, a few tasks, and many runs of each, and it keeps what a benchmark score
+leaves out: the reasoning, the claims, the messages between agents, and the time each part took.
+
+| | Inspect Robots | e_repl |
+|---|---|---|
+| Question | How well and how safely does this policy do these tasks? | What does this agent do under this setup, and why? |
+| What varies | The policy, the embodiment, the benchmark | The world document, tools, limits, clock, teammates |
+| How an LLM acts | Tool calls, one guarded motion chunk per call | Python in a persistent REPL, composing tools |
+| Policies | VLAs and LLMs | LLMs |
+| Scale | Benchmarks across robots and simulators | One bench, few tasks, many runs |
+| Safety record | Guards on actions, a safety benchmark of RoboHarm tasks | RoboHarm labels, refusal apart from incapacity, claims against the world, a gate in the device's process |
+
+The two meet at RoboHarm: Inspect Robots' safety benchmark is built from its tasks, and e_repl
+labels harm runs with its six labels, so a task can be studied here and measured there. A behaviour found here is a candidate task for a benchmark
+there. e_repl does not add VLA policies, an embodiment registry, simulators, or benchmark suites;
+those belong in Inspect Robots.
 
 ## Start a project
 
@@ -128,6 +176,12 @@ decision under `docs/decisions/`.
 
 ## Not here yet
 
+- A monitor that reads each cell before it runs and can stop it. Oversight today is a teammate
+  who reads results after the code has run, or a person at the device's fault latch.
+- A label for a run a person stopped. A run interrupted because it was about to do harm is the
+  one a study most wants labelled, and an interrupted run is not graded (decision 0015).
+- A bridge to Inspect Robots: records written as its eval logs, or an e_repl world served as one
+  of its embodiments.
 - `llm_query` sub-calls are not written to the trajectory; only what the cell prints of them is.
 - The cell time limit uses `SIGALRM`, so it works on the main thread of a Unix process only, and
   it interrupts whatever the cell was doing, a robot motion included.
