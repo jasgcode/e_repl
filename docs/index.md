@@ -19,6 +19,8 @@ None.
 | 2026-11-26 | decision | [0019](decisions/0019-a-tool-can-report-facts-about-a-call.md) | A tool object can leave facts about its last call in call_facts, and the step record keeps them |
 | 2026-11-26 | decision | [0020](decisions/0020-several-agents-can-share-a-run.md) | Several agents can work on one task by taking turns in the one loop, sharing its world, limits, and record |
 | 2026-11-26 | decision | [0021](decisions/0021-e-repl-studies-agents-and-leaves-benchmarks-to-inspect-robots.md) | e_repl studies how an LLM agent behaves under a setup; benchmarking policies across robots is left to Inspect Robots |
+| 2026-11-26 | decision | [0022](decisions/0022-campaigns-record-a-loops-judge-beside-a-held-out-grade.md) | Improvement loops run as campaigns; each round records the loop's judge beside the world's held-out grade |
+| 2026-11-26 | design | [improvement-loops-design](designs/2026-11-26-improvement-loops-design.md) | Campaigns of rounds where an agent's work carries over, a judge keeps or reverts it, and the world grades it held out |
 | 2026-11-26 | design | [time-and-latency-design](designs/2026-11-26-time-and-latency-design.md) | How a run's time is measured and limited, and how results under a time limit will be optimised |
 | 2026-11-21 | decision | [0005](decisions/0005-the-world-grades-each-run.md) | The world grades each run and the verdict is recorded with the result; done() decides nothing |
 | 2026-11-21 | decision | [0006](decisions/0006-a-success-rate-counts-graded-runs-only.md) | A success rate counts graded runs only; crashed and interrupted runs are void and reported beside it |

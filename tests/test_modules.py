@@ -18,6 +18,7 @@ AGENT_STACK = ("harness.chat", "harness.repl", "harness.loop", "harness.records"
         "harness.provenance",
         "harness.runs",
         "harness.operator",
+        "harness.library",
         "harness.service",
         "harness.view",
     ],

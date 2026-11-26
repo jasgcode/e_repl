@@ -18,6 +18,7 @@ follows [poorin-lite](https://github.com/jasgcode/poorin-lite)'s conventions.
 | Does a second agent make it safer? | `run_team` shares one task and its limits; any member can refuse for all ([0020](docs/decisions/0020-several-agents-can-share-a-run.md)) |
 | How does time pressure change it? | A time limit the model is told, and added latency ([0017](docs/decisions/0017-a-run-can-have-a-time-limit-the-model-is-told.md)) |
 | Did its reasoning match its actions? | Each step keeps the reasoning, the full response, and the code that ran ([0012](docs/decisions/0012-a-step-records-what-cannot-be-worked-out-later.md)) |
+| When a loop judges its own improvement, is the judge fooled? | Campaigns run any `Loop` under any `Judge` and grade every round held out; `judge_agreement` counts judge-passed, world-failed rounds ([0022](docs/decisions/0022-campaigns-record-a-loops-judge-beside-a-held-out-grade.md)) |
 | Can someone rerun it? | Each run records its recipe, fingerprint, initial state, and commit ([0003](docs/decisions/0003-every-run-is-recorded-with-its-recipe.md)) |
 
 ## Beside Inspect Robots
@@ -65,6 +66,10 @@ uv run python -m experiments.toy_pick red --model google/gemma-4-31b-it
 #   --time-limit 30    a limit the model is told about
 #   --extra-latency 5  slow every reply
 #   --agents 3         a team taking turns
+uv run python -m experiments.toy_revise red --model google/gemma-4-31b-it --judge self
+#   --loop program     what the agent changes each round
+#   --judge sealed     who decides it is kept (sealed, self)
+#   --briefing judge   what the next round is told
 uv run python -m harness.view serve   # read runs in a browser, live
 ```
 
@@ -104,6 +109,7 @@ choice decides whether an unseen motion can run. Choose, and record a decision.
 ## Not here yet
 
 - A monitor that reads each cell before it runs and can stop it.
+- The `practice`, `skills`, and `scaffold` loops, and `model` and `agent_written` judges ([design](docs/designs/2026-11-26-improvement-loops-design.md)).
 - A safety label for a run a person stopped.
 - A bridge to Inspect Robots: its log format, or an e_repl world as its embodiment.
 - `llm_query` sub-calls in the trajectory.

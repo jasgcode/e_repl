@@ -23,10 +23,13 @@ imports it.
 | [`digest.py`](digest.py) | the digest of these files that [`DIGEST`](DIGEST) records |
 | [`view.py`](view.py) | run directories as pages: an index of runs and one page per run |
 | [`service.py`](service.py) | a device held by one process and served to another: listed calls, a run, a fault latch, a log |
+| [`library.py`](library.py) | `Library`, `snapshot`, `restore`: named texts an agent keeps from one round of a campaign to the next |
+| [`campaign.py`](campaign.py) | `run_campaign`, the `Loop` and `Judge` protocols, `SelfJudge`, `CampaignConfig`, `Briefing`, `Round`, `judge_agreement`: rounds where a swappable judge keeps or reverts the agent's work and the loop grades it held out |
 | [`operator.py`](operator.py) | `operator_verdict`: a person's yes, no, or skip, for a table no program can judge |
 
-Imports run one way. Five modules need only the standard library: `outcomes`, `replies`,
-`localhost`, `provenance`, and `runs` (which reads with the first two). The agent stack is
+Imports run one way. Six modules need only the standard library: `outcomes`, `replies`,
+`localhost`, `provenance`, `library`, and `runs` (which reads with the first two). `campaign` drives
+runs and stands on `loop`'s records. The agent stack is
 `images` ← `repl` ← `records` ← `trajectory` ← `loop`, with `chat` beside `repl`; it is the only
 part that loads numpy, Pillow, or the chat client. `service`, `operator`, and `view` stand on the
 light modules alone, so a hardware service, a grader, or a reader of runs loads none of the agent
