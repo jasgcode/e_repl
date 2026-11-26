@@ -1,10 +1,8 @@
 # e_repl
 
-A template for agents that act through one persistent Python REPL. The model has a single action,
+A flexible framework/ harness for agentic robotics for studying how agents perform under different objective based setups. The model has a single action,
 "run this cell"; tools are ordinary Python objects in the namespace; every run is written to disk
-as a trajectory. It was pulled out of `simple_101` (an SO-101 arm driven by free NVIDIA NIM models)
-and follows the conventions of [poorin-lite](https://github.com/jasgcode/poorin-lite). Copy it to
-start a project; the copy is yours.
+as a trajectory. The repo follows the conventions of [poorin-lite](https://github.com/jasgcode/poorin-lite).
 
 ## Start a project
 
