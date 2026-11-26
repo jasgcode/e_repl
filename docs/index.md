@@ -9,6 +9,23 @@ None.
 
 | Date | Kind | Document | Summary |
 |---|---|---|---|
+| 2026-11-26 | decision | [0012](decisions/0012-a-step-records-what-cannot-be-worked-out-later.md) | A step records the model's reasoning, the endpoint's whole response, the times, and all the model was shown |
+| 2026-11-26 | decision | [0013](decisions/0013-traces-are-read-through-a-viewer-with-no-scripts.md) | Run directories are read through a local viewer that escapes all model text and carries no scripts |
+| 2026-11-26 | decision | [0014](decisions/0014-give-up-ends-a-run-without-a-claim-of-success.md) | give_up(reason) ends a run beside done(), so a false claim of success can be told from an honest stop |
+| 2026-11-26 | decision | [0015](decisions/0015-a-run-can-carry-a-safety-label-beside-its-verdict.md) | A task that defines a harm gives each run one of RoboHarm's six safety labels, apart from its verdict |
+| 2026-11-26 | decision | [0016](decisions/0016-a-run-keeps-a-time-ledger.md) | Every step times the model apart from the endpoint and times each tool call, so a run's time splits five ways |
+| 2026-11-26 | decision | [0017](decisions/0017-a-run-can-have-a-time-limit-the-model-is-told.md) | A run can have a wall-clock limit the model is told about; everything counts and no code runs after it |
+| 2026-11-26 | decision | [0018](decisions/0018-the-harness-serves-hardware.md) | The harness ships the service a hardware project needs, with listed calls, a run, a fault latch, and a log |
+| 2026-11-26 | decision | [0019](decisions/0019-a-tool-can-report-facts-about-a-call.md) | A tool object can leave facts about its last call in call_facts, and the step record keeps them |
+| 2026-11-26 | design | [time-and-latency-design](designs/2026-11-26-time-and-latency-design.md) | How a run's time is measured and limited, and how results under a time limit will be optimised |
+| 2026-11-21 | decision | [0005](decisions/0005-the-world-grades-each-run.md) | The world grades each run and the verdict is recorded with the result; done() decides nothing |
+| 2026-11-21 | decision | [0006](decisions/0006-a-success-rate-counts-graded-runs-only.md) | A success rate counts graded runs only; crashed and interrupted runs are void and reported beside it |
+| 2026-11-21 | decision | [0007](decisions/0007-the-prompt-is-a-world-document-and-a-protocol.md) | The system prompt is a harness-free world document followed by the harness's protocol, each recorded |
+| 2026-11-21 | decision | [0008](decisions/0008-a-run-records-the-worlds-initial-state.md) | A run records what rebuilds the world's initial state, required and left out of the fingerprint |
+| 2026-11-21 | decision | [0009](decisions/0009-the-harness-records-a-digest-of-its-files.md) | The harness records a digest of its own files, and the tests fail when a copy no longer matches it |
+| 2026-11-21 | decision | [0010](decisions/0010-a-world-can-run-as-its-own-process.md) | A world can run as its own process, with HTTP for the agent's client and a pipe for its owner's verdict |
+| 2026-11-21 | decision | [0011](decisions/0011-a-grader-may-decline.md) | A grader may return no verdict; the run it declines is void, like a crashed or interrupted one |
+| 2026-11-21 | design | [embodied-first-exam-principles-design](designs/2026-11-21-embodied-first-exam-principles-design.md) | What e_repl takes from Embodied First Exam, where the harness seam is at the world and the world grades |
 | 2026-11-17 | decision | [0001](decisions/0001-one-action-a-persistent-repl.md) | The model's only action is running a cell in a persistent Python REPL |
 | 2026-11-17 | decision | [0002](decisions/0002-openai-chat-format-over-http.md) | Chat models sit behind a two-method protocol; messages stay OpenAI chat dicts |
 | 2026-11-17 | decision | [0003](decisions/0003-every-run-is-recorded-with-its-recipe.md) | Every run streams to a recorder with its recipe, fingerprint, provenance, and outcome |

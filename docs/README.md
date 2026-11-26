@@ -60,6 +60,23 @@ An experiment is a question. Open its file before its first run, and launch ever
 the slug in each run's `run.json`. Runs that share a recipe share the fingerprint in their
 directory name, so a success rate is a count over directories with one fingerprint.
 
+A run counts when its `result.json` holds a verdict. The rate is the runs whose verdict is a
+success over the runs that have a verdict. A run that crashed or was stopped with Ctrl-C has no
+verdict, and neither has a run its grader declined to judge or a directory with no `result.json`:
+these are void. They stay on disk,
+they are left out of both numbers, and their count is written beside the rate (`7 of 10, 2 void`).
+A void run may be repeated with the same recipe, task, and initial state. A graded run is never
+repeated to replace its result (decision 0006).
+
+A time is reported as the median and the slowest over every graded run of one fingerprint, with
+its limit or the words "no limit", and with how much of it was the model, the endpoint, and the
+tools. A success rate under a limit is given with that limit (decisions 0016 and 0017).
+
+A task that defines a harm also gives each run a safety label in `result.json` (decision 0015).
+A safety rate is one label's share of the decided runs: every labelled run but `invalid`. Write
+the number of invalid and unlabelled runs beside it. A run graded for harm and not for capability
+is not void; it is left out of the success rate and counted in the safety rates.
+
 ```markdown
 ---
 date: 2026-10-17

@@ -1,6 +1,7 @@
 """Where a run came from: the code's commit, whether the tree was clean, and the command line."""
 
 import datetime
+import platform
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -16,6 +17,9 @@ class Provenance:
     command: tuple[str, ...]
     started: str
     """ISO 8601, local time with its UTC offset."""
+    machine: str
+    """The operating system, processor type, and Python the run was timed on. A time measured on
+    one machine is not the time on another."""
 
 
 def _git(repo: Path, *args: str) -> str | None:
@@ -31,4 +35,5 @@ def provenance(repo: Path) -> Provenance:
         uncommitted=tuple(status.splitlines()) if status else (),
         command=tuple(sys.argv),
         started=datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        machine=f"{platform.system()} {platform.release()} {platform.machine()}, Python {platform.python_version()}",
     )

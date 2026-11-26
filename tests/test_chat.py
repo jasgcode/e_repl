@@ -6,7 +6,8 @@ from typing import Any
 import numpy as np
 import pytest
 
-from harness.chat import ChatError, OpenAIChat, ScriptedChat, llm_query_tool
+from harness import chat as chat_module
+from harness.chat import ChatError, OpenAIChat, Reply, ScriptedChat, SlowedChat, llm_query_tool, split_thinking
 from harness.images import ImageSettings
 
 
@@ -45,11 +46,61 @@ def _chat(endpoint: FakeEndpoint, retries: int = 3) -> OpenAIChat:
     return OpenAIChat(model="m", base_url="http://host/v1/", api_key="secret", retries=retries, session=endpoint)
 
 
-def test_a_rate_limited_request_is_retried_and_thinking_is_stripped():
+def test_a_rate_limited_request_is_retried_and_the_thinking_is_kept_apart_from_the_answer():
     endpoint = FakeEndpoint([_rate_limited(), _reply("<think>hmm</think>\nthe answer")])
-    assert _chat(endpoint).complete([{"role": "user", "content": "q"}]) == "the answer"
+    reply = _chat(endpoint).complete([{"role": "user", "content": "q"}])
+    assert reply.text == "the answer" and reply.reasoning == "hmm" and reply.attempts == 2
     assert [r["url"] for r in endpoint.requests] == ["http://host/v1/chat/completions"] * 2
     assert endpoint.requests[0]["headers"]["Authorization"] == "Bearer secret"
+
+
+def test_a_reply_keeps_the_endpoints_whole_response_and_its_separate_reasoning_field():
+    body = {
+        "model": "m-2026-10",
+        "choices": [{"finish_reason": "length", "message": {"content": "cut", "reasoning_content": "first I"}}],
+        "usage": {"prompt_tokens": 7, "completion_tokens": 3},
+    }
+    reply = _chat(FakeEndpoint([FakeResponse(200, body)])).complete([])
+    assert reply.text == "cut" and reply.reasoning == "first I"
+    assert reply.response == body
+
+
+def test_a_thought_that_was_cut_off_is_all_thinking_so_code_inside_it_is_not_the_answer():
+    answer, thinking = split_thinking("ok <think>plan:\n```repl\nrobot.release()\n```")
+    assert answer == "ok" and thinking is not None and "robot.release()" in thinking
+    assert split_thinking("just the answer") == ("just the answer", None)
+
+
+def test_a_models_latency_is_kept_apart_from_the_waits_on_a_rate_limited_endpoint(monkeypatch):
+    class Clock:
+        now = 0.0
+
+        def monotonic(self) -> float:
+            return self.now
+
+        def sleep(self, seconds: float) -> None:
+            self.now += seconds
+
+    clock = Clock()
+    monkeypatch.setattr(chat_module, "time", clock)
+
+    class TwoSecondEndpoint(FakeEndpoint):
+        def post(self, url: str, **kwargs: Any) -> FakeResponse:
+            clock.now += 2  # each request takes two seconds to answer
+            return super().post(url, **kwargs)
+
+    limited = FakeResponse(429, headers={"Retry-After": "5"})
+    reply = _chat(TwoSecondEndpoint([limited, _reply("the answer")])).complete([])
+    assert (reply.attempts, reply.request_seconds, reply.seconds) == (2, 2, 9)
+
+
+def test_a_slowed_model_takes_its_extra_seconds_on_every_call_and_says_so_in_its_recipe():
+    slept: list[float] = []
+    slowed = SlowedChat(ScriptedChat(["one", "two"]), extra_seconds=3.0, sleep=slept.append)
+    replies = [slowed.complete([]), slowed.complete([])]
+    assert slept == [3.0, 3.0]
+    assert replies == [Reply("one", seconds=3.0, request_seconds=3.0), Reply("two", seconds=3.0, request_seconds=3.0)]
+    assert slowed.recipe() == {"model": "scripted", "extra_seconds": 3.0}
 
 
 def test_a_refused_request_raises_with_the_endpoints_message():

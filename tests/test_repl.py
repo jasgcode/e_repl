@@ -8,7 +8,7 @@ import pytest
 from PIL import Image
 
 from harness.images import ImageSettings
-from harness.repl import CellStatus, Repl, ReplConfig, describe_tools, truncate
+from harness.repl import CellStatus, Ending, Repl, ReplConfig, describe_tools, truncate
 
 
 def _repl(tools=None, config: ReplConfig | None = None) -> Repl:
@@ -81,8 +81,94 @@ def test_long_output_is_truncated_to_the_configured_limit():
 def test_done_ends_only_the_cell_that_called_it():
     repl = _repl()
     finished = repl.run("done('picked the red box')")
-    assert finished.done and finished.answer == "picked the red box"
-    assert not repl.run("1 + 1").done
+    assert finished.ending is Ending.DONE and finished.answer == "picked the red box"
+    assert repl.run("1 + 1").ending is None
+
+
+def test_each_tool_call_a_cell_makes_is_timed_once_under_the_name_the_model_used():
+    class Arm:
+        def goto(self, x: float) -> None:
+            """Move."""
+
+        def grasp(self, x: float) -> None:
+            """Move twice."""
+            self.goto(x)
+            self.goto(x)
+
+        def jam(self) -> None:
+            """Fail."""
+            raise RuntimeError("stuck")
+
+    def weigh(parcel: str) -> float:
+        """Weight in kilograms."""
+        return 1.0
+
+    arm = Arm()
+    repl = _repl({"arm": arm, "weigh": weigh, "np": np})
+    cell = "arm.grasp(1.0)\nweigh('a')\ntry:\n    arm.jam()\nexcept RuntimeError:\n    pass\nnp.zeros(2)"
+    calls = repl.run(cell).calls
+    assert [(call.name, call.raised) for call in calls] == [
+        ("arm.grasp", None),  # its two calls to goto are part of it
+        ("weigh", None),
+        ("arm.jam", "RuntimeError"),
+    ]
+    assert all(call.seconds >= 0 for call in calls)
+    assert repl.namespace["arm"] is arm and repl.run("type(arm).__name__").text == "'Arm'"
+    assert repl.run("x = 1").calls == ()
+
+
+def test_a_tool_can_report_facts_about_a_call_and_each_call_gets_its_own():
+    class Camera:
+        def __init__(self) -> None:
+            self.call_facts: dict | None = None
+            self.age = 0.4
+
+        def frame(self) -> int:
+            """A frame."""
+            self.call_facts = {"frame_age": self.age}
+            self.age += 0.1
+            return 1
+
+        def size(self) -> int:
+            """The frame's size."""
+            return 640
+
+    camera = Camera()
+    calls = _repl({"cam": camera}).run("cam.frame()\ncam.size()\ncam.frame()").calls
+    assert [(call.name, call.facts) for call in calls] == [
+        ("cam.frame", {"frame_age": 0.4}),
+        ("cam.size", None),
+        ("cam.frame", {"frame_age": 0.5}),
+    ]
+    assert camera.call_facts is None
+
+
+def test_a_tool_whose_methods_cannot_be_timed_is_refused_when_the_repl_is_built():
+    class Sealed:
+        __slots__ = ()
+
+        def read(self) -> int:
+            """Read."""
+            return 1
+
+    with pytest.raises(TypeError, match="tool 'sealed' cannot be timed"):
+        _repl({"sealed": Sealed()})
+
+
+def test_refuse_ends_the_run_with_its_reason_and_needs_one():
+    repl = _repl()
+    stopped = repl.run("refuse('it would hurt someone')")
+    assert stopped.ending is Ending.REFUSED and stopped.answer == "it would hurt someone"
+    assert "refuse() needs a reason" in repl.run("refuse('')").text
+
+
+def test_give_up_ends_the_run_with_its_reason_and_refuses_an_empty_one():
+    repl = _repl()
+    stopped = repl.run("give_up('the bin is out of reach')")
+    assert stopped.ending is Ending.GAVE_UP and stopped.answer == "the bin is out of reach"
+    silent = repl.run("give_up('  ')")
+    assert silent.ending is None and silent.status is CellStatus.ERROR
+    assert "give_up() needs a reason" in silent.text
 
 
 def test_show_attaches_a_captioned_image():
@@ -113,8 +199,9 @@ def test_a_shown_image_is_shrunk_and_keeps_its_colors():
 
 
 def test_a_tool_may_not_take_a_builtins_name():
-    with pytest.raises(ValueError, match="done"):
-        _repl({"done": print})
+    for name in ("show", "done", "give_up", "refuse"):
+        with pytest.raises(ValueError, match=name):
+            _repl({name: print})
 
 
 def test_tools_are_described_by_signature_and_first_docstring_line():

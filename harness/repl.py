@@ -11,6 +11,7 @@ belongs inside the tool that drives the hardware, where every call passes throug
 
 import ast
 import contextlib
+import functools
 import inspect
 import io
 import linecache
@@ -18,7 +19,7 @@ import signal
 import threading
 import time
 import traceback
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import CodeType
@@ -28,7 +29,7 @@ import numpy as np
 
 from harness.images import ImageSettings, ObservedImage, encode_image
 
-BUILTIN_NAMES = ("show", "done")
+BUILTIN_NAMES = ("show", "done", "give_up", "refuse")
 NO_OUTPUT = "(no output)"
 NO_VARIABLES = "(no variables yet)"
 SUMMARY_WIDTH = 80
@@ -37,6 +38,40 @@ SUMMARY_WIDTH = 80
 class CellStatus(StrEnum):
     OK = "ok"
     ERROR = "error"
+    NOT_RUN = "not_run"
+    """The reply arrived after the run's time limit, so its code was never run."""
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    """One call a cell made to a tool, as the REPL timed it."""
+
+    name: str
+    """The name the model used: ``robot.goto``, or ``llm_query`` for a function."""
+    at: float
+    """When the call began, in seconds since the REPL was built: the run's clock, near enough.
+
+    With it, the age of what the model last saw when it acted can be worked out afterwards.
+    """
+    seconds: float
+    raised: str | None
+    """The type of what the call raised, or ``None`` when it returned."""
+    facts: dict[str, Any] | None
+    """What the tool itself said about this call: how old the frame was, how long the hardware took.
+
+    A tool object reports them by setting its ``call_facts`` attribute to a dict during the call.
+    """
+
+
+class Ending(StrEnum):
+    """How a cell asked to end the run. Either way the world still grades what was done."""
+
+    DONE = "done"
+    """``done()``: the model says the task is complete."""
+    GAVE_UP = "gave_up"
+    """``give_up()``: the model says the task cannot be done."""
+    REFUSED = "refused"
+    """``refuse()``: the model says the task should not be done."""
 
 
 @dataclass(frozen=True)
@@ -46,7 +81,11 @@ class ReplConfig:
     max_output_chars: int = 4000
     max_images_per_cell: int = 4
     cell_timeout: float | None = 60.0
-    """Seconds before a cell is interrupted; ``None`` lets cells run forever."""
+    """Seconds before a cell is interrupted; ``None`` lets cells run forever.
+
+    A backstop for runaway model code. It raises at whatever line is running, inside a tool or not,
+    so a tool with long calls bounds them itself and this stays longer than the longest of them.
+    """
     images: ImageSettings = field(default_factory=ImageSettings)
 
 
@@ -55,12 +94,12 @@ class Observation:
     status: CellStatus
     text: str
     images: tuple[ObservedImage, ...]
+    ending: Ending | None
+    """Set when the cell called ``done()``, ``give_up()`` or ``refuse()``."""
     answer: str | None
-    """What the cell passed to ``done()``; ``None`` if it did not call it."""
-
-    @property
-    def done(self) -> bool:
-        return self.answer is not None
+    """What the cell passed to that call; ``None`` if it made neither."""
+    calls: tuple[ToolCall, ...]
+    """The tool calls the cell made, in the order they ended. A tool's calls to itself are not listed."""
 
 
 def truncate(text: str, limit: int) -> str:
@@ -122,7 +161,7 @@ def _first_line(obj: Any) -> str:
 
 
 @contextlib.contextmanager
-def _time_limit(seconds: float | None) -> Iterator[None]:
+def _time_limit(seconds: float | None, exceeded: str) -> Iterator[None]:
     """Interrupt a runaway cell with SIGALRM, then hand any outer alarm its remaining time.
 
     SIGALRM only reaches the main thread; elsewhere cells run without a limit.
@@ -132,7 +171,7 @@ def _time_limit(seconds: float | None) -> Iterator[None]:
         return
 
     def on_alarm(signum: int, frame: Any) -> None:
-        raise TimeoutError(f"cell exceeded the {seconds:g}s time limit")
+        raise TimeoutError(exceeded)
 
     previous_handler = signal.signal(signal.SIGALRM, on_alarm)
     outer_remaining, outer_interval = signal.setitimer(signal.ITIMER_REAL, seconds)
@@ -148,7 +187,7 @@ def _time_limit(seconds: float | None) -> Iterator[None]:
 
 
 class Repl:
-    """A namespace that survives across cells, with ``show()`` and ``done()`` built in."""
+    """A namespace that survives across cells, with ``show()`` and the three calls that end a run built in."""
 
     def __init__(self, tools: Mapping[str, Any], config: ReplConfig):
         clashes = set(tools) & set(BUILTIN_NAMES)
@@ -156,12 +195,60 @@ class Repl:
             raise ValueError(f"tool names {sorted(clashes)} are reserved for the REPL's own builtins")
         self.tools = dict(tools)
         self.config = config
-        self.namespace: dict[str, Any] = {"__name__": "__repl__", "show": self._show, "done": self._done}
-        self.namespace.update(self.tools)
+        self.namespace: dict[str, Any] = {
+            "__name__": "__repl__",
+            "show": self._show,
+            "done": self._done,
+            "give_up": self._give_up,
+            "refuse": self._refuse,
+        }
+        self._calls: list[ToolCall] = []
+        self._depth = 0
+        self._born = time.monotonic()
+        self.namespace.update({name: self._instrumented(name, tool) for name, tool in self.tools.items()})
         self._hidden = set(self.namespace)
         self._cells = 0
         self._images: list[ObservedImage] = []
+        self._ending: Ending | None = None
         self._answer: str | None = None
+
+    def _instrumented(self, name: str, tool: Any) -> Any:
+        """``tool`` with its calls timed. An object stays the same object, so the model sees no wrapper."""
+        if inspect.ismodule(tool):
+            return tool
+        if inspect.isroutine(tool):
+            return self._timed(name, tool, owner=None)
+        for attr, _ in inspect.getmembers(type(tool), inspect.isfunction):
+            if attr.startswith("_"):
+                continue
+            try:
+                setattr(tool, attr, self._timed(f"{name}.{attr}", getattr(tool, attr), owner=tool))
+            except AttributeError as e:  # slots, or a frozen dataclass
+                raise TypeError(f"tool {name!r} cannot be timed: its methods cannot be replaced on the object") from e
+        return tool
+
+    def _timed(self, label: str, call: Callable[..., Any], owner: Any) -> Callable[..., Any]:
+        @functools.wraps(call)
+        def timed(*args: Any, **kwargs: Any) -> Any:
+            if self._depth:  # a tool calling its own methods is part of the call already being timed
+                return call(*args, **kwargs)
+            self._depth += 1
+            start, raised = time.monotonic(), None
+            try:
+                return call(*args, **kwargs)
+            except BaseException as e:
+                raised = type(e).__name__
+                raise
+            finally:
+                self._depth -= 1
+                facts = getattr(owner, "call_facts", None)
+                if isinstance(facts, dict):
+                    owner.call_facts = None  # each call reports its own
+                else:
+                    facts = None
+                self._calls.append(ToolCall(label, start - self._born, time.monotonic() - start, raised, facts))
+
+        return timed
 
     def _show(self, image: np.ndarray, caption: str = "") -> None:
         """Attach an image (HxW gray or HxWx3 BGR, uint8) to this turn's observation."""
@@ -171,8 +258,20 @@ class Repl:
         self._images.append(encode_image(np.asarray(image), caption, self.config.images))
 
     def _done(self, answer: str = "") -> None:
-        """Finish the task. Pass a short summary of what happened."""
-        self._answer = str(answer)
+        """End the run: the task is complete. Pass a short summary of what happened."""
+        self._ending, self._answer = Ending.DONE, str(answer)
+
+    def _give_up(self, reason: str) -> None:
+        """End the run: the task cannot be done. Pass the reason."""
+        if not str(reason).strip():
+            raise ValueError("give_up() needs a reason: say what stopped you, as in give_up('the bin is out of reach')")
+        self._ending, self._answer = Ending.GAVE_UP, str(reason)
+
+    def _refuse(self, reason: str) -> None:
+        """End the run: the task should not be done. Pass the reason."""
+        if not str(reason).strip():
+            raise ValueError("refuse() needs a reason: say why the task should not be done")
+        self._ending, self._answer = Ending.REFUSED, str(reason)
 
     def variable_summary(self) -> str:
         """One line per variable the model defined, for the observation."""
@@ -185,14 +284,23 @@ class Repl:
             return NO_VARIABLES
         return "\n".join(f"{name} = {summarize(self.namespace[name])}" for name in names)
 
-    def run(self, code: str) -> Observation:
-        """Run one cell. Any failure becomes an ERROR observation; only Ctrl-C escapes."""
+    def run(self, code: str, time_left: float | None = None) -> Observation:
+        """Run one cell. Any failure becomes an ERROR observation; only Ctrl-C escapes.
+
+        ``time_left`` is what remains of the run's own time limit, if it has one. The cell is
+        stopped when that runs out, as it is at ``cell_timeout``.
+        """
+        limit = self.config.cell_timeout
+        exceeded = "" if limit is None else f"cell exceeded the {limit:g}s time limit"
+        if time_left is not None and (limit is None or time_left < limit):
+            limit, exceeded = max(time_left, 1e-3), "the run's time limit ended this cell"
         self._cells += 1
         filename = f"<cell {self._cells}>"
         # Register the source so tracebacks can show the failing line.
         linecache.cache[filename] = (len(code), None, code.splitlines(True), filename)
         self._images = []
-        self._answer = None
+        self._calls = []
+        self._ending, self._answer = None, None
         out = io.StringIO()
         status = CellStatus.OK
         try:
@@ -200,7 +308,7 @@ class Repl:
             with (
                 contextlib.redirect_stdout(out),
                 contextlib.redirect_stderr(out),
-                _time_limit(self.config.cell_timeout),
+                _time_limit(limit, exceeded),
             ):
                 exec(body, self.namespace)
                 if tail is not None:
@@ -218,7 +326,9 @@ class Repl:
             status=status,
             text=truncate(out.getvalue().rstrip(), self.config.max_output_chars) or NO_OUTPUT,
             images=tuple(self._images),
+            ending=self._ending,
             answer=self._answer,
+            calls=tuple(self._calls),
         )
 
 

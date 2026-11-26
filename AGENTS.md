@@ -18,6 +18,9 @@ uvx ty@0.0.84 check --error-on-warning
 
 # Regenerate docs/index.md after changing anything under docs/ (the tests check it)
 uv run python -m harness.docs
+
+# Regenerate harness/DIGEST after changing anything under harness/ (the tests check it)
+uv run python -m harness.digest
 ```
 
 - Python >= 3.13.
@@ -33,19 +36,66 @@ uv run python -m harness.docs
   `extract_code`.
 - A tool's signature and the first line of its docstring are what the model sees. Write that line
   for the model: what the call does, its units, its frame.
+- `AgentConfig.instructions` describes the world: what is in it, the units, the rules. Nothing in
+  it names the harness (cells, `show`, `done`, steps); that text belongs in `PROTOCOL`.
+- An experiment passes `run_agent` the `initial_state` that rebuilds its world (a seed, a scene's
+  name), and `{}` only when nothing can.
 - A tool that refuses a call raises an exception whose message says what was wrong and what would
-  be allowed. Never return an error string or `False` for a refusal.
+  be allowed. Never return an error string or `False` for a refusal. A refused call does nothing.
+- A tool never changes an argument silently. It refuses the call, or it carries out the adjusted
+  call and its result says what was adjusted.
+- A tool whose call can stop partway (a motion, a timed wait) bounds the call itself and returns
+  or raises with how much ran and the state it stopped in. `ReplConfig.cell_timeout` is a backstop
+  for runaway model code: it interrupts a tool at whatever line is running and the tool reports
+  nothing, so set it longer than the longest call any tool allows.
+- A tool returns data and never calls `show()`. What enters the context is the decision of the
+  model's code.
+- The instructions say what the hardware does between cells (holds its pose, goes limp) and what
+  a new call does to a motion still under way.
 - The REPL is not a sandbox. Put a safety limit inside the tool that drives the hardware. Never
   weaken, bypass, or rewrite a safety gate the user owns; propose the change and stop.
 - A mock tool and its real counterpart keep the same method names, argument order, and units.
+  So does a client of a world that runs as its own process, down to the first line of each
+  docstring; a test compares what `describe_tools` shows for the two.
+- A world that runs as a service gives its verdict to the process that started it, never over
+  the channel its client uses, and has no path that returns state the task asks the model to
+  find. Its safety limit is on the service's side, in the class that drives the hardware.
 - A value that changes what the model sees or does belongs in `AgentConfig`, `ReplConfig`, or a
   chat model's `recipe()`, so the run record and the fingerprint hold it. An argument is for how a
   run executes: the runs directory, the API key, logging.
 - `harness/` reads no environment variables and holds no model IDs. A command in `experiments/`
   reads the environment once and passes values in.
 - Every run goes through a `Recorder`. Never add a path through the loop that skips it.
+- A record keeps everything the model wrote, thought, and was shown. Never drop or shorten text
+  before it is recorded; shorten it for the model, and record what was sent and what came back.
+- Hardware is served with `harness.service`. Never add a call, a flag, or a timeout that clears
+  the fault latch, never serve a call that cuts power or parks the device, and never answer a
+  request without a line in the `ActionLog`.
+- A device moves only inside a run. An experiment on hardware opens the run with its time limit
+  and closes it before the grader looks. Opening and closing a run are never on a tool the model
+  holds.
+- A time is measured on hardware. A mock checks the code; a time from a mock is never reported as
+  the task's.
+- A run has one clock, and everything counts on it. Never add a second clock that leaves out the
+  endpoint, the tools, or the harness, and never run code after `time_limit` has passed.
+- A setting that makes a run faster (a model option, an image size, a delay) goes in the recipe,
+  so the fingerprint holds it.
+- Report a time as the median and the slowest over every graded run of one fingerprint, with its
+  limit, never as the best run.
+- `harness.view` shows records to people. Escape every value it puts in a page and never add a
+  script to one: a trace is text a model chose.
+- A run's success is the `Verdict` of the experiment's grader, never `Outcome.DONE` or the model's
+  answer. `give_up(reason)` is how a model stops without claiming success and `refuse(reason)` how
+  it declines a task; never fold the endings back into one.
+- A task that defines a harm passes `judge_harm`, which reports what the world observed (`none`,
+  `attempted`, `crossed`). The label comes from `safety_verdict` alone: never compute one of the
+  six labels in a task, and never count a capability failure as safe. A grader is a function the experiment holds: never a tool, and never a public method of
+  one, because the model is shown those and could call it. A grader that cannot judge returns
+  `None`; it never guesses.
 - `harness/` must not import from `src/` or `experiments/`; project code imports `harness`, never
   the other way.
+- `harness/DIGEST` identifies this copy of the harness. It equals e_repl's at some commit, or the
+  harness was changed here on purpose, and the commit that changes the digest says which.
 
 ## Project docs
 
@@ -58,6 +108,8 @@ rules and a template for each kind.
 - Work on an experiment through its file. Open `docs/experiments/<slug>.md` before its first run,
   launch with `--experiment <slug>`, append dated entries to its `Log` as results arrive, and close
   it with a `Conclusion` that cites runs by directory name. A dead end closes too, saying why.
+- A success rate counts graded runs only. Write the number of void runs (crashed, interrupted, or
+  with no `result.json`) beside it, and never repeat a graded run to replace its result.
 - Write specs and implementation plans to `docs/designs/` (`YYYY-MM-DD-<slug>-design.md`,
   `YYYY-MM-DD-<slug>-plan.md`), not to the repository root or `docs/superpowers/`.
 - Run `uv run python -m harness.docs` before committing a change under `docs/`.
@@ -158,5 +210,8 @@ implementation exists, use it. Do not create parallel implementations.
 - Prefer real objects and small fakes over mocks; never assert on a mock's own behavior. Use
   `ScriptedChat` for the model and `MemoryRecorder` for the recorder.
 - No test needs the network, an API key, or hardware.
+- A task is admitted by three scripted models run through `run_agent` with its grader: a reference
+  solution graded a success, a model that only calls `done()` graded a failure, and a model that
+  writes the state the grader reads graded a failure.
 - No sleeps to wait for work; synchronize on events, barriers, or the result.
 - Always fix tests you broke. Do not relax tolerances or hack around failures.
