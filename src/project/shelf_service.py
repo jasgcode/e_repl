@@ -28,22 +28,20 @@ import sys
 import threading
 from collections.abc import Iterator
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
 from typing import IO, Any
 
 import click
 import numpy as np
 
-from harness.records import Verdict
+from harness import localhost
+from harness.localhost import ANY_FREE_PORT, QuietHandler
+from harness.outcomes import Verdict
 from project.shelf_client import PHOTO_PATH, PICK_PATH, REFUSED_KEY, REFUSED_STATUS
 from project.toy import COLORS, PickRefused, Shelf, pick_verdict, shuffled_shelf
 
 logger = logging.getLogger(__name__)
 
-HOST = "127.0.0.1"
-ANY_FREE_PORT = 0
-SHUTDOWN_POLL = 0.02
-"""Seconds between the serving thread's checks for a shutdown; the standard library's 0.5 makes every stop wait."""
 URL_KEY = "url"
 EPISODE_OVER = "the episode is over, so nothing more can be picked; call done()"
 
@@ -76,14 +74,14 @@ class Episode:
 
 
 def _handler(episode: Episode) -> type[BaseHTTPRequestHandler]:
-    class Handler(BaseHTTPRequestHandler):
+    class Handler(QuietHandler):
         def do_GET(self) -> None:
             if self.path != PHOTO_PATH:
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             photo = io.BytesIO()
             np.save(photo, episode.photo())
-            self._reply(HTTPStatus.OK, "application/octet-stream", photo.getvalue())
+            self.send_body(HTTPStatus.OK, "application/octet-stream", photo.getvalue())
 
         def do_POST(self) -> None:
             if self.path != PICK_PATH:
@@ -94,19 +92,9 @@ def _handler(episode: Episode) -> type[BaseHTTPRequestHandler]:
                 episode.pick(_slot(body))
             except PickRefused as e:
                 refusal = json.dumps({REFUSED_KEY: str(e)}).encode()
-                self._reply(REFUSED_STATUS, "application/json", refusal)
+                self.send_body(REFUSED_STATUS, "application/json", refusal)
                 return
-            self._reply(HTTPStatus.NO_CONTENT, "application/json", b"")
-
-        def _reply(self, status: HTTPStatus, content_type: str, body: bytes) -> None:
-            self.send_response(status)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 (the base class's name)
-            logger.debug(format, *args)  # the base class writes every request to stderr
+            self.send_body(HTTPStatus.NO_CONTENT, "application/json", b"")
 
     return Handler
 
@@ -119,18 +107,9 @@ def _slot(body: Any) -> int:
     return slot
 
 
-@contextlib.contextmanager
-def serving(episode: Episode, port: int) -> Iterator[str]:
+def serving(episode: Episode, port: int) -> contextlib.AbstractContextManager[str]:
     """Serve ``episode`` on localhost from a background thread. Yields the service's URL."""
-    server = HTTPServer((HOST, port), _handler(episode))
-    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": SHUTDOWN_POLL}, daemon=True)
-    thread.start()
-    try:
-        yield f"http://{HOST}:{server.server_port}"
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join()
+    return localhost.serving(_handler(episode), port)
 
 
 class ShelfService:

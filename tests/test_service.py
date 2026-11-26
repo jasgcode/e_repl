@@ -6,7 +6,8 @@ from collections.abc import Iterator
 import pytest
 import requests
 
-from harness.service import ANY_FREE_PORT, ActionLog, Device, Service, ServiceCallFailed, ServiceClient, serving
+from harness.localhost import ANY_FREE_PORT
+from harness.service import ActionLog, Device, Service, ServiceCallFailed, ServiceClient, serving
 
 
 class TooHigh(Exception):

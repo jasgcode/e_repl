@@ -1,7 +1,7 @@
 """The operator's verdict, with a scripted person at the prompt."""
 
 from harness.operator import NOTE_PROMPT, QUESTION, operator_verdict
-from harness.records import Verdict
+from harness.outcomes import Verdict
 
 
 def _person(*answers: str):

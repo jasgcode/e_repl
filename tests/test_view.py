@@ -10,27 +10,24 @@ import requests
 
 from harness import loop, repl
 from harness.chat import Reply, ScriptedChat
-from harness.loop import AgentConfig, run_agent
-from harness.records import Harm, HarmFinding, Verdict
+from harness.localhost import ANY_FREE_PORT
+from harness.loop import AgentConfig, Member, run_agent, run_team
+from harness.outcomes import Harm, HarmFinding, Verdict
 from harness.repl import Repl, ReplConfig
-from harness.trajectory import STEPS_FILENAME, DirectoryRecorder
-from harness.view import (
-    ANY_FREE_PORT,
-    CONTENT_SECURITY_POLICY,
-    UNFINISHED,
-    export_run,
+from harness.runs import (
+    STEPS_FILENAME,
+    Standing,
     percentile,
     rate_text,
     read_run,
     read_runs,
-    render_index,
-    render_run,
     run_flags,
     safety_text,
-    serving,
     time_ledger,
     time_text,
 )
+from harness.trajectory import DirectoryRecorder
+from harness.view import CONTENT_SECURITY_POLICY, IMAGE_CACHE, export_run, render_index, render_run, serving
 from tests.pacing import Clock, Paced
 
 INSTRUCTIONS = "You switch a lamp."
@@ -143,7 +140,7 @@ def test_a_run_still_being_written_is_shown_with_the_steps_it_has(tmp_path):
     steps = (run_dir / STEPS_FILENAME).read_text().splitlines()
     (run_dir / STEPS_FILENAME).write_text(steps[0] + "\n" + steps[1][:40])  # the second line is half written
     run = read_run(run_dir)
-    assert run.standing == UNFINISHED and [step["step"] for step in run.steps] == [1]
+    assert run.standing is Standing.UNFINISHED and [step["step"] for step in run.steps] == [1]
     assert 'http-equiv="refresh"' in _page(run_dir)
     assert 'http-equiv="refresh"' not in export_run(run_dir)
 
@@ -165,7 +162,9 @@ def test_the_server_serves_pages_images_and_records_and_nothing_else_under_the_r
         assert index.status_code == 200 and 'href="/run/a"' in index.text
         assert index.headers["Content-Security-Policy"] == CONTENT_SECURITY_POLICY
         assert "The model wrote" in requests.get(f"{url}/run/a", timeout=5).text
-        assert requests.get(f"{url}/run/a/step001_0.jpg", timeout=5).content.startswith(b"\xff\xd8")
+        image = requests.get(f"{url}/run/a/step001_0.jpg", timeout=5)
+        assert image.content.startswith(b"\xff\xd8") and image.headers["Cache-Control"] == IMAGE_CACHE
+        assert requests.get(f"{url}/run/a", timeout=5).headers["Cache-Control"] == "no-store"
         assert json.loads(requests.get(f"{url}/run/a/run.json", timeout=5).text)["task"] == "Switch the lamp on."
         for path in ("/run/a/notes.txt", "/run/a/..%2Fsecret.txt", "/run/%2E%2E/secret.txt", "/run/b", "/secret.txt"):
             assert requests.get(url + path, timeout=5).status_code == 404
@@ -259,3 +258,23 @@ def test_a_percentile_is_interpolated_between_the_samples_around_it():
     assert percentile([10, 20, 30, 40], 0.5) == 25
     assert percentile([10, 20, 30, 40], 0.9) == pytest.approx(37)
     assert percentile([7], 0.95) == 7
+
+
+def test_a_team_run_shows_who_took_each_step_what_they_told_each_other_and_who_ended_it(tmp_path):
+    members = [
+        Member("ada", ScriptedChat([_cell("tell('<b>left</b> switch')")]), {}, role="You find the switch."),
+        Member("bo", ScriptedChat([_cell("done('on')")]), {}),
+    ]
+    recorder = DirectoryRecorder(tmp_path, repo=tmp_path)
+    config = AgentConfig(instructions=INSTRUCTIONS, max_steps=4)
+    run_team("Switch the lamp on.", members, ReplConfig(), config, recorder, lambda: YES, {}, None)
+    run = read_run(recorder.run_dir)
+    page = render_run(run, lambda file: file, home="/")
+    assert run.model == "ada: scripted, bo: scripted"
+    assert "2 agents taking turns: ada (You find the switch.); bo" in page
+    assert '<span class="badge agent">ada</span>' in page and '<span class="badge agent">bo</span>' in page
+    assert "It told its team" in page and "Its team had told it" in page
+    assert "ada: &lt;b&gt;left&lt;/b&gt; switch" in page and "<b>left</b>" not in page
+    assert "done, by bo" in page and "ada 1, bo 1" in page
+    assert "What bo was told: the world, then the harness and its team" in page
+    assert "ada: scripted, bo: scripted" in render_index([run], None)

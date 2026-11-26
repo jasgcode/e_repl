@@ -15,19 +15,16 @@ out afterwards: the model's reasoning, the endpoint's whole response, and the ti
 """
 
 import dataclasses
-import datetime
 import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from harness.provenance import Provenance, provenance
-from harness.records import RunHeader, RunResult, Step
+from harness.provenance import Provenance, provenance, utc_timestamp
+from harness.records import AgentPrompt, RunHeader, RunResult, Step
+from harness.runs import HEADER_FILENAME, RESULT_FILENAME, STEPS_FILENAME, image_filename
 
-HEADER_FILENAME = "run.json"
-STEPS_FILENAME = "steps.jsonl"
-RESULT_FILENAME = "result.json"
 RUN_TIME_FORMAT = "%Y%m%d-%H%M%S"
 
 
@@ -57,16 +54,18 @@ class MemoryRecorder:
         self.results.append(result)
 
 
-def image_filename(step: int, image: int) -> str:
-    return f"step{step:03d}_{image}.jpg"
-
-
-def utc_timestamp(unix_time: float) -> str:
-    """``unix_time`` as an ISO 8601 UTC time to the millisecond, the form every record uses."""
-    return datetime.datetime.fromtimestamp(unix_time, datetime.UTC).isoformat(timespec="milliseconds")
+def _prompt_record(prompt: AgentPrompt) -> dict[str, str]:
+    return {
+        "system_prompt": prompt.system_prompt,
+        "world_document": prompt.world_document,
+        "protocol": prompt.protocol,
+    }
 
 
 def header_record(header: RunHeader, source: Provenance, started: float) -> dict[str, Any]:
+    """``run.json``. One agent's prompt is at the top level; a team's are under ``team``, one per agent."""
+    single = len(header.prompts) == 1
+    unset = dict.fromkeys(_prompt_record(header.prompts[0]))
     return {
         "task": header.task,
         "started": utc_timestamp(started),
@@ -74,9 +73,8 @@ def header_record(header: RunHeader, source: Provenance, started: float) -> dict
         "experiment": header.experiment,
         "fingerprint": header.fingerprint,
         "recipe": header.recipe,
-        "system_prompt": header.system_prompt,
-        "world_document": header.world_document,
-        "protocol": header.protocol,
+        **(_prompt_record(header.prompts[0]) if single else unset),
+        "team": None if single else [{"agent": prompt.agent, **_prompt_record(prompt)} for prompt in header.prompts],
         "provenance": dataclasses.asdict(source),
     }
 
@@ -86,7 +84,10 @@ def step_record(step: Step) -> dict[str, Any]:
     observation = step.observation
     return {
         "step": step.index,
+        "agent": step.agent,
         "started": utc_timestamp(step.started),
+        "heard": list(step.heard),
+        "told": list(step.told),
         "reasoning": step.reply.reasoning,
         "reply": step.reply.text,
         "code": step.code,

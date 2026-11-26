@@ -21,25 +21,20 @@ import time
 import traceback
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
-from enum import StrEnum
 from types import CodeType
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 
 from harness.images import ImageSettings, ObservedImage, encode_image
+from harness.outcomes import CellStatus, Ending
 
 BUILTIN_NAMES = ("show", "done", "give_up", "refuse")
 NO_OUTPUT = "(no output)"
 NO_VARIABLES = "(no variables yet)"
 SUMMARY_WIDTH = 80
-
-
-class CellStatus(StrEnum):
-    OK = "ok"
-    ERROR = "error"
-    NOT_RUN = "not_run"
-    """The reply arrived after the run's time limit, so its code was never run."""
+TIMED = "__repl_timed__"
+"""Marks a method a REPL has already wrapped, so a tool held by several REPLs is wrapped once."""
 
 
 @dataclass(frozen=True)
@@ -61,17 +56,6 @@ class ToolCall:
 
     A tool object reports them by setting its ``call_facts`` attribute to a dict during the call.
     """
-
-
-class Ending(StrEnum):
-    """How a cell asked to end the run. Either way the world still grades what was done."""
-
-    DONE = "done"
-    """``done()``: the model says the task is complete."""
-    GAVE_UP = "gave_up"
-    """``give_up()``: the model says the task cannot be done."""
-    REFUSED = "refused"
-    """``refuse()``: the model says the task should not be done."""
 
 
 @dataclass(frozen=True)
@@ -97,7 +81,7 @@ class Observation:
     ending: Ending | None
     """Set when the cell called ``done()``, ``give_up()`` or ``refuse()``."""
     answer: str | None
-    """What the cell passed to that call; ``None`` if it made neither."""
+    """What the cell passed to that call; ``None`` if it made none of them."""
     calls: tuple[ToolCall, ...]
     """The tool calls the cell made, in the order they ended. A tool's calls to itself are not listed."""
 
@@ -126,6 +110,11 @@ def summarize(value: Any, width: int = SUMMARY_WIDTH) -> str:
     return f"{type(value).__name__}{size}: {text[: width - 30]}..."
 
 
+def public_methods(tool: Any) -> list[tuple[str, Callable[..., Any]]]:
+    """The calls a tool object offers the model: the functions of its class not named with a leading ``_``."""
+    return [(attr, fn) for attr, fn in inspect.getmembers(type(tool), inspect.isfunction) if not attr.startswith("_")]
+
+
 def describe_tools(tools: Mapping[str, Any]) -> str:
     """The preloaded names as the system prompt lists them: signatures and first docstring lines.
 
@@ -139,9 +128,8 @@ def describe_tools(tools: Mapping[str, Any]) -> str:
             lines.append(f"- {name}{_signature(obj)}: {_first_line(obj)}")
         else:
             lines.append(f"- {name}: {type(obj).__name__}. {_first_line(obj)}")
-            for attr, member in inspect.getmembers(type(obj), inspect.isfunction):
-                if not attr.startswith("_"):
-                    lines.append(f"    {name}.{attr}{_signature(member, drop_self=True)}: {_first_line(member)}")
+            for attr, member in public_methods(obj):
+                lines.append(f"    {name}.{attr}{_signature(member, drop_self=True)}: {_first_line(member)}")
     return "\n".join(lines)
 
 
@@ -186,8 +174,26 @@ def _time_limit(seconds: float | None, exceeded: str) -> Iterator[None]:
             signal.setitimer(signal.ITIMER_REAL, left, outer_interval)
 
 
+def _timed_method(owner: Any, attr: str, call: Callable[..., Any]) -> Callable[..., Any]:
+    """``owner.attr`` timed for whichever REPL is running a cell. It holds no REPL, so it keeps none alive."""
+
+    @functools.wraps(call)
+    def timed(*args: Any, **kwargs: Any) -> Any:
+        repl = Repl.active
+        name = None if repl is None else repl.tool_names.get(id(owner))
+        if repl is None or name is None:  # a call from outside any cell, or from a REPL that does not hold it
+            return call(*args, **kwargs)
+        return repl.timed_call(f"{name}.{attr}", owner, call, args, kwargs)
+
+    setattr(timed, TIMED, True)
+    return timed
+
+
 class Repl:
     """A namespace that survives across cells, with ``show()`` and the three calls that end a run built in."""
+
+    active: ClassVar["Repl | None"] = None
+    """The REPL whose cell is running in this process. A tool call is timed for it alone."""
 
     def __init__(self, tools: Mapping[str, Any], config: ReplConfig):
         clashes = set(tools) & set(BUILTIN_NAMES)
@@ -202,53 +208,65 @@ class Repl:
             "give_up": self._give_up,
             "refuse": self._refuse,
         }
-        self._calls: list[ToolCall] = []
+        self.tool_names: dict[int, str] = {}
+        """The name each tool object goes by in this namespace, by ``id``: how a timed call is labelled."""
         self._depth = 0
         self._born = time.monotonic()
         self.namespace.update({name: self._instrumented(name, tool) for name, tool in self.tools.items()})
         self._hidden = set(self.namespace)
         self._cells = 0
+        self._new_cell()
+
+    def _new_cell(self) -> None:
+        """Forget what the last cell showed, called, and asked for."""
         self._images: list[ObservedImage] = []
-        self._ending: Ending | None = None
-        self._answer: str | None = None
+        self._calls: list[ToolCall] = []
+        self._ending: tuple[Ending, str] | None = None
 
     def _instrumented(self, name: str, tool: Any) -> Any:
         """``tool`` with its calls timed. An object stays the same object, so the model sees no wrapper."""
         if inspect.ismodule(tool):
             return tool
         if inspect.isroutine(tool):
-            return self._timed(name, tool, owner=None)
-        for attr, _ in inspect.getmembers(type(tool), inspect.isfunction):
-            if attr.startswith("_"):
-                continue
+            return self._timed_function(name, tool)
+        self.tool_names[id(tool)] = name
+        for attr, _ in public_methods(tool):
+            if getattr(inspect.getattr_static(tool, attr), TIMED, False):
+                continue  # another REPL holds this object too; a call is timed for the REPL whose cell made it
             try:
-                setattr(tool, attr, self._timed(f"{name}.{attr}", getattr(tool, attr), owner=tool))
+                setattr(tool, attr, _timed_method(tool, attr, getattr(tool, attr)))
             except AttributeError as e:  # slots, or a frozen dataclass
                 raise TypeError(f"tool {name!r} cannot be timed: its methods cannot be replaced on the object") from e
         return tool
 
-    def _timed(self, label: str, call: Callable[..., Any], owner: Any) -> Callable[..., Any]:
+    def _timed_function(self, name: str, call: Callable[..., Any]) -> Callable[..., Any]:
         @functools.wraps(call)
         def timed(*args: Any, **kwargs: Any) -> Any:
-            if self._depth:  # a tool calling its own methods is part of the call already being timed
+            if Repl.active is not self:
                 return call(*args, **kwargs)
-            self._depth += 1
-            start, raised = time.monotonic(), None
-            try:
-                return call(*args, **kwargs)
-            except BaseException as e:
-                raised = type(e).__name__
-                raise
-            finally:
-                self._depth -= 1
-                facts = getattr(owner, "call_facts", None)
-                if isinstance(facts, dict):
-                    owner.call_facts = None  # each call reports its own
-                else:
-                    facts = None
-                self._calls.append(ToolCall(label, start - self._born, time.monotonic() - start, raised, facts))
+            return self.timed_call(name, None, call, args, kwargs)
 
         return timed
+
+    def timed_call(self, label: str, owner: Any, call: Callable[..., Any], args: tuple, kwargs: dict) -> Any:
+        """Make one tool call from this REPL's running cell and list it with the cell's calls."""
+        if self._depth:  # a tool calling its own methods is part of the call already being timed
+            return call(*args, **kwargs)
+        self._depth += 1
+        start, raised = time.monotonic(), None
+        try:
+            return call(*args, **kwargs)
+        except BaseException as e:
+            raised = type(e).__name__
+            raise
+        finally:
+            self._depth -= 1
+            facts = getattr(owner, "call_facts", None)
+            if isinstance(facts, dict):
+                owner.call_facts = None  # each call reports its own
+            else:
+                facts = None
+            self._calls.append(ToolCall(label, start - self._born, time.monotonic() - start, raised, facts))
 
     def _show(self, image: np.ndarray, caption: str = "") -> None:
         """Attach an image (HxW gray or HxWx3 BGR, uint8) to this turn's observation."""
@@ -259,19 +277,18 @@ class Repl:
 
     def _done(self, answer: str = "") -> None:
         """End the run: the task is complete. Pass a short summary of what happened."""
-        self._ending, self._answer = Ending.DONE, str(answer)
+        self._ending = Ending.DONE, str(answer)
 
     def _give_up(self, reason: str) -> None:
         """End the run: the task cannot be done. Pass the reason."""
-        if not str(reason).strip():
-            raise ValueError("give_up() needs a reason: say what stopped you, as in give_up('the bin is out of reach')")
-        self._ending, self._answer = Ending.GAVE_UP, str(reason)
+        self._ending = (
+            Ending.GAVE_UP,
+            _reason(reason, "give_up() needs a reason: say what stopped you, as in give_up('the bin is out of reach')"),
+        )
 
     def _refuse(self, reason: str) -> None:
         """End the run: the task should not be done. Pass the reason."""
-        if not str(reason).strip():
-            raise ValueError("refuse() needs a reason: say why the task should not be done")
-        self._ending, self._answer = Ending.REFUSED, str(reason)
+        self._ending = Ending.REFUSED, _reason(reason, "refuse() needs a reason: say why the task should not be done")
 
     def variable_summary(self) -> str:
         """One line per variable the model defined, for the observation."""
@@ -298,11 +315,10 @@ class Repl:
         filename = f"<cell {self._cells}>"
         # Register the source so tracebacks can show the failing line.
         linecache.cache[filename] = (len(code), None, code.splitlines(True), filename)
-        self._images = []
-        self._calls = []
-        self._ending, self._answer = None, None
+        self._new_cell()
         out = io.StringIO()
         status = CellStatus.OK
+        outer, Repl.active = Repl.active, self  # a cell can run another REPL's cell, as a sub-model's tool does
         try:
             body, tail = _compile_cell(code, filename)
             with (
@@ -322,14 +338,24 @@ class Repl:
         except BaseException as e:
             status = CellStatus.ERROR
             out.write(_format_error(e))
+        finally:
+            Repl.active = outer
+        ending, answer = self._ending or (None, None)
         return Observation(
             status=status,
             text=truncate(out.getvalue().rstrip(), self.config.max_output_chars) or NO_OUTPUT,
             images=tuple(self._images),
-            ending=self._ending,
-            answer=self._answer,
+            ending=ending,
+            answer=answer,
             calls=tuple(self._calls),
         )
+
+
+def _reason(reason: str, missing: str) -> str:
+    """``reason`` as text, or a ``ValueError`` saying ``missing`` when it is blank."""
+    if not str(reason).strip():
+        raise ValueError(missing)
+    return str(reason)
 
 
 def _compile_cell(code: str, filename: str) -> tuple[CodeType, CodeType | None]:

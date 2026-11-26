@@ -15,6 +15,7 @@ import numpy as np
 import requests
 
 from harness.images import ImageSettings, ObservedImage, encode_image
+from harness.replies import finish_reason
 
 type Message = dict[str, Any]
 
@@ -53,9 +54,8 @@ class Reply:
 
     @property
     def finish_reason(self) -> str | None:
-        """Why the endpoint says the reply stopped (``stop``, ``length``, ``content_filter``), if it said."""
-        choices = (self.response or {}).get("choices") or [{}]
-        return choices[0].get("finish_reason")
+        """Why the endpoint says the reply stopped (a ``FinishReason``), if it said."""
+        return finish_reason(self.response)
 
 
 class ChatModel(Protocol):

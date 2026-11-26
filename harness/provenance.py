@@ -22,6 +22,11 @@ class Provenance:
     one machine is not the time on another."""
 
 
+def utc_timestamp(unix_time: float) -> str:
+    """``unix_time`` as an ISO 8601 UTC time to the millisecond, the form every record uses."""
+    return datetime.datetime.fromtimestamp(unix_time, datetime.UTC).isoformat(timespec="milliseconds")
+
+
 def _git(repo: Path, *args: str) -> str | None:
     result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=False)
     return result.stdout.rstrip("\n") if result.returncode == 0 else None

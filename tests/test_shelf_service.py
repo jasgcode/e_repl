@@ -7,12 +7,14 @@ import pytest
 import requests
 
 from harness.chat import ScriptedChat
+from harness.localhost import ANY_FREE_PORT
 from harness.loop import AgentConfig, run_agent
-from harness.records import Outcome, RunResult
+from harness.outcomes import Outcome
+from harness.records import RunResult
 from harness.repl import Repl, ReplConfig, describe_tools
 from harness.trajectory import MemoryRecorder
 from project.shelf_client import ShelfClient
-from project.shelf_service import ANY_FREE_PORT, Episode, running_shelf_service, serving
+from project.shelf_service import Episode, running_shelf_service, serving
 from project.toy import INSTRUCTIONS, PickRefused, Shelf, shuffled_shelf
 from tests.shelf_scripts import CLAIM, FIND, LOOK, PICK
 

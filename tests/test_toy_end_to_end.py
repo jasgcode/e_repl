@@ -9,9 +9,10 @@ import pytest
 
 from harness.chat import ScriptedChat
 from harness.loop import AgentConfig, run_agent
+from harness.outcomes import CellStatus, Outcome
 from harness.provenance import provenance
-from harness.records import Outcome, RunResult
-from harness.repl import CellStatus, Repl, ReplConfig
+from harness.records import RunResult
+from harness.repl import Repl, ReplConfig
 from harness.trajectory import DirectoryRecorder, MemoryRecorder
 from project.toy import INSTRUCTIONS, PickRefused, Shelf, pick_verdict, shuffled_shelf
 from tests.shelf_scripts import CLAIM, FIND, FORGE, LOOK, PICK

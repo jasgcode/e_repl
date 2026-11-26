@@ -2,7 +2,7 @@
 
 from collections.abc import Callable
 
-from harness.records import Verdict
+from harness.outcomes import Verdict
 
 QUESTION = "Did the robot do the task? [y]es, [n]o, or [s]kip to give no verdict"
 NOTE_PROMPT = "Note for the record (optional)"

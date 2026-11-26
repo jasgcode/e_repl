@@ -8,21 +8,29 @@ imports it.
 
 | Module | Holds |
 |---|---|
+| [`outcomes.py`](outcomes.py) | `CellStatus`, `Ending`, `Outcome`, `Verdict`, `Harm`, `HarmFinding`, `SafetyLabel`, `safety_verdict` |
+| [`replies.py`](replies.py) | `extract_code`, `CODE_BLOCK`, `FinishReason`, `finish_reason`: what a reply says to the harness |
 | [`images.py`](images.py) | `ImageSettings`, `ObservedImage`, `encode_image`: pixels to the JPEG bytes the model sees |
-| [`repl.py`](repl.py) | `Repl`, `ReplConfig`, `Observation`, `CellStatus`, `describe_tools` |
+| [`repl.py`](repl.py) | `Repl`, `ReplConfig`, `Observation`, `ToolCall`, `describe_tools`, `public_methods` |
 | [`chat.py`](chat.py) | the `ChatModel` protocol, `Reply`, `OpenAIChat`, `ScriptedChat`, `llm_query_tool` |
-| [`records.py`](records.py) | `RunHeader` and its fingerprint, `Step`, `RunResult`, `Outcome`, `Verdict` |
-| [`provenance.py`](provenance.py) | the commit, uncommitted files, and command line behind a run |
+| [`records.py`](records.py) | `AgentPrompt`, `RunHeader` and its fingerprint, `Step`, `RunResult` |
+| [`provenance.py`](provenance.py) | the commit, uncommitted files, and command line behind a run; `utc_timestamp` |
+| [`runs.py`](runs.py) | run directories read back: `Run`, `read_runs`, `Standing`, `time_ledger`, `run_flags`, the rates |
 | [`trajectory.py`](trajectory.py) | the `Recorder` protocol, `DirectoryRecorder`, `MemoryRecorder` |
-| [`loop.py`](loop.py) | `AgentConfig`, `world_document`, `PROTOCOL`, `extract_code`, `run_agent` |
+| [`loop.py`](loop.py) | `AgentConfig`, `world_document`, `PROTOCOL`, `run_agent`, `run_team`, `Member`, `swarm` |
+| [`localhost.py`](localhost.py) | `serving`: a server on localhost from a background thread, for the viewer and every service |
 | [`docs.py`](docs.py) | the project docs' headers and the generated `docs/index.md` |
 | [`digest.py`](digest.py) | the digest of these files that [`DIGEST`](DIGEST) records |
 | [`view.py`](view.py) | run directories as pages: an index of runs and one page per run |
 | [`service.py`](service.py) | a device held by one process and served to another: listed calls, a run, a fault latch, a log |
 | [`operator.py`](operator.py) | `operator_verdict`: a person's yes, no, or skip, for a table no program can judge |
 
-Imports run one way: `images` ← `repl` ← `records` ← `trajectory` ← `loop`, with `chat` beside
-`repl`. `view` reads what `trajectory` writes. `docs` and `digest` stand alone.
+Imports run one way. Five modules need only the standard library: `outcomes`, `replies`,
+`localhost`, `provenance`, and `runs` (which reads with the first two). The agent stack is
+`images` ← `repl` ← `records` ← `trajectory` ← `loop`, with `chat` beside `repl`; it is the only
+part that loads numpy, Pillow, or the chat client. `service`, `operator`, and `view` stand on the
+light modules alone, so a hardware service, a grader, or a reader of runs loads none of the agent
+stack; `tests/test_modules.py` checks it. `docs` and `digest` stand alone.
 
 ## The digest
 
@@ -125,6 +133,33 @@ Only `text` goes back into the context; the rest is for the record.
    that, the run's ending, and the endpoint's content filter into one of RoboHarm's six labels,
    stored as the result's `safety`. Pass `judge_harm=None` for a task that defines no harm.
 
+## Teams
+
+`run_team(task, members, repl_config, config, recorder, grade, initial_state, judge_harm,
+experiment=None) -> RunResult` runs two or more agents on one task, in the same loop.
+
+```python
+tools = {"robot": robot, "cam": cam}
+members = [
+    Member("mover", chat, tools, role="You move the arm."),
+    Member("checker", chat, {"cam": cam}, role="You look after each move and say what you see."),
+]
+result = run_team(task, members, ReplConfig(), config, recorder, grade, initial_state, judge_harm)
+```
+
+- A `Member` is a name, a chat model, the tools it holds, and an optional role. `swarm(count,
+  chat, tools)` makes equal members named `agent-1`, `agent-2`, and so on.
+- Each member has its own conversation and its own namespace. Members that hold the same tool
+  objects share a world; a member given fewer tools can do less.
+- They take turns in the order given. `config.max_steps` and `config.time_limit` are the team's.
+- `tell(message)` sends text to every other member. It appears at the top of the receiver's next
+  observation under `[from your team]`.
+- Any member's `done()`, `give_up()`, or `refuse()` ends the run for all. It is graded once.
+- A step records its `agent`, what it `heard`, and what it `told`. `run.json` holds each member's
+  prompt under `team`, and the recipe holds each member's name, role, and model.
+
+A run with one agent is unchanged: the same prompt, the same fingerprint, no `tell`.
+
 ## Recipes and fingerprints
 
 A run's recipe is `{"agent": AgentConfig, "repl": ReplConfig, "chat": chat.recipe()}`. Its
@@ -167,7 +202,10 @@ with server(service, port=8101) as http_server:
 - A call that raises anything but one of `refusals` is a fault. Every later motion is refused
   until a person presses Enter at the server (`service.clear_on_enter(sys.stdin)`).
 - Every request is written to the `ActionLog` before it is answered: the call, its arguments, its
-  outcome, its seconds, and `reading()` before and after.
+  outcome, the device's seconds for it, and `reading()` before and after.
+
+`Service` holds these rules, and the HTTP handler only carries a request to it and its `Answer`
+back, so a test or another transport drives the same rules.
 
 The model's tool is a small class that wraps the `ServiceClient` and has the device's own
 methods, so the model is shown those and nothing else. A tool object can set `call_facts` to a
@@ -182,7 +220,9 @@ uv run python -m harness.view serve                              # http://127.0.
 uv run python -m harness.view export runs/<run> --out trace.html # one file, images inside
 ```
 
-`serve` reads the directories on each request, so a run page follows a run while it is written.
+`serve` reads an unfinished run again on each request, so a run page follows a run while it is
+written; a run with a result never changes and is read once. `harness.runs` is the reader on its
+own, for a script that counts rates or times runs without rendering a page.
 The index lists runs newest first with one success rate per fingerprint. A run page shows what
 the model claimed beside what the world found, with an alarm when the two disagree (`done` and a
 failure, or `gave_up` and a success) or when the run crossed its task's harm threshold, then each step: the reasoning, the reply with the

@@ -6,8 +6,9 @@ import pytest
 from harness import loop
 from harness.chat import ChatError, Reply, ScriptedChat
 from harness.loop import NO_CODE_BLOCK, AgentConfig, run_agent
-from harness.records import Harm, HarmFinding, Outcome, RunResult, SafetyLabel, Verdict, safety_verdict
-from harness.repl import CellStatus, Repl, ReplConfig
+from harness.outcomes import CellStatus, Harm, HarmFinding, Outcome, SafetyLabel, Verdict, safety_verdict
+from harness.records import RunResult
+from harness.repl import Repl, ReplConfig
 from harness.trajectory import MemoryRecorder
 from tests.pacing import Clock, Paced
 
@@ -141,7 +142,7 @@ def test_the_first_prompt_holds_the_instructions_the_tools_and_the_task():
     assert system["content"].startswith(INSTRUCTIONS)
     assert "- weigh(parcel: str) -> float: Weight of a parcel in kilograms." in system["content"]
     assert user["content"] == "Task: sort the red parcel"
-    assert recorder.headers[0].system_prompt == system["content"]
+    assert recorder.headers[0].prompts[0].system_prompt == system["content"]
 
 
 def test_the_world_document_is_recorded_apart_from_the_harness_protocol():
@@ -151,17 +152,17 @@ def test_the_world_document_is_recorded_apart_from_the_harness_protocol():
 
     _, chat, recorder = _run([_cell("done()")], tools={"weigh": weigh})
     header = recorder.headers[0]
-    assert header.world_document == (
+    assert header.prompts[0].world_document == (
         "You sort parcels.\n\nTools:\n- weigh(parcel: str) -> float: Weight of a parcel in kilograms."
     )
-    assert "```repl" in header.protocol and "done(" in header.protocol
-    assert chat.prompts[0][0]["content"] == f"{header.world_document}\n\n{header.protocol}"
+    assert "```repl" in header.prompts[0].protocol and "done(" in header.prompts[0].protocol
+    assert chat.prompts[0][0]["content"] == f"{header.prompts[0].world_document}\n\n{header.prompts[0].protocol}"
 
 
 def test_the_model_is_told_its_step_budget_at_the_start_and_in_every_observation():
     config = AgentConfig(instructions=INSTRUCTIONS, max_steps=3)
     _, chat, recorder = _run([_cell("1"), _cell("2"), _cell("3")], config=config)
-    assert "The run ends after 3 steps." in recorder.headers[0].protocol
+    assert "The run ends after 3 steps." in recorder.headers[0].prompts[0].protocol
     headers = [prompt[-1]["content"][0]["text"].splitlines()[0] for prompt in chat.prompts[1:]]
     assert headers == ["[step 1 of 3 ok]", "[step 2 of 3 ok]"]
 
@@ -334,7 +335,7 @@ def test_a_reply_that_arrives_after_the_time_limit_is_recorded_and_its_code_neve
 def test_the_model_is_told_its_time_limit_and_after_each_cell_how_much_is_left(clock):
     chat = Paced(clock, [_cell("x = 1"), _cell("y = 2"), _cell("done()")], seconds=10)
     _, recorder = _timed_run(clock, chat, 45)
-    assert "It also ends 45 seconds after it starts" in " ".join(recorder.headers[0].protocol.split())
+    assert "It also ends 45 seconds after it starts" in " ".join(recorder.headers[0].prompts[0].protocol.split())
     shown = [prompt[-1]["content"][0]["text"].splitlines()[0] for prompt in chat.prompts[1:]]
     assert shown == ["[step 1 of 10 ok, 35 s left]", "[step 2 of 10 ok, 25 s left]"]
     assert [step.time_left for step in recorder.steps] == [35, 25, 15]
@@ -343,7 +344,7 @@ def test_the_model_is_told_its_time_limit_and_after_each_cell_how_much_is_left(c
 def test_a_run_without_a_time_limit_tells_the_model_nothing_about_time(clock):
     chat = Paced(clock, [_cell("done()")], seconds=10)
     result, recorder = _timed_run(clock, chat, None)
-    assert "seconds after it starts" not in recorder.headers[0].protocol
+    assert "seconds after it starts" not in recorder.headers[0].prompts[0].protocol
     assert result.outcome is Outcome.DONE and recorder.steps[0].time_left is None
 
 

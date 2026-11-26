@@ -63,6 +63,12 @@ uv run python -m experiments.toy_pick red --model google/gemma-4-31b-it --time-l
 uv run python -m experiments.toy_pick red --model google/gemma-4-31b-it --extra-latency 5
 ```
 
+Put several agents on one task. They take turns, share the shelf, and can tell each other things:
+
+```bash
+uv run python -m experiments.toy_pick red --model google/gemma-4-31b-it --agents 3
+```
+
 Read the runs in a browser, live while they are written:
 
 ```bash
@@ -110,10 +116,12 @@ there, one of RoboHarm's six.
 11. **It is built for real hardware.** A device is served from the process that holds it: only
     listed calls run, it moves only inside a run, a fault stops it until a person has looked, and
     every request is logged there. See [`harness/service.py`](harness/service.py).
+12. **More than one agent is an option.** `run_team` puts several agents on one task in the same
+    loop: they take turns, share the world and the limits, and any one of them can end the run.
 
 ## The one policy left open
 
-`extract_code` in [`harness/loop.py`](harness/loop.py) decides what a reply with several code
+`extract_code` in [`harness/replies.py`](harness/replies.py) decides what a reply with several code
 blocks means. The baseline runs the first block and drops the rest without telling the model.
 The alternatives: run all of them as one cell (fewer turns, but the model acts on results it has
 not seen), or refuse the reply and ask for exactly one (strict, costs a turn). On a robot the

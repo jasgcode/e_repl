@@ -68,6 +68,9 @@ uv run python -m harness.digest
 - Every run goes through a `Recorder`. Never add a path through the loop that skips it.
 - A record keeps everything the model wrote, thought, and was shown. Never drop or shorten text
   before it is recorded; shorten it for the model, and record what was sent and what came back.
+- A team is agents taking turns in the one loop. Never run agents at the same time in one
+  process, never give a team a second grader or recorder, and never let one member's `refuse()`
+  be overruled by the others.
 - Hardware is served with `harness.service`. Never add a call, a flag, or a timeout that clears
   the fault latch, never serve a call that cuts power or parks the device, and never answer a
   request without a line in the `ActionLog`.

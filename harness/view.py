@@ -3,7 +3,8 @@
     uv run python -m harness.view serve                        # http://127.0.0.1:8300
     uv run python -m harness.view export runs/<run> --out trace.html
 
-``serve`` reads the directories on every request, so a run can be watched while it is written.
+``serve`` reads a run again on every request until it has a result, so a run can be watched while
+it is written; a finished run never changes, so it is read once.
 ``export`` writes one run as a single file with its images inside, to send or attach.
 
 The pages are for someone who was not there and wants to know what a model did: what it was
@@ -16,13 +17,9 @@ import base64
 import contextlib
 import html
 import json
-import math
-import re
 import statistics
-import threading
 import time
-from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from collections.abc import Callable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -31,35 +28,50 @@ from urllib.parse import parse_qs, quote, urlsplit
 
 import click
 
-from harness.loop import CODE_BLOCK
-from harness.records import DECIDED_LABELS, SafetyLabel
-from harness.trajectory import HEADER_FILENAME, RESULT_FILENAME, STEPS_FILENAME
+from harness import localhost
+from harness.localhost import HOST, QuietHandler, server_url
+from harness.outcomes import CellStatus, Outcome, SafetyLabel
+from harness.replies import CODE_BLOCK, FinishReason
+from harness.runs import (
+    IMAGE_MEDIA_TYPE,
+    RUN_FILE,
+    Run,
+    Standing,
+    TimeLedger,
+    model_seconds,
+    percentile,
+    rate_text,
+    read_run,
+    run_flags,
+    run_names,
+    safety_text,
+    step_finish_reason,
+    step_usage,
+    time_ledger,
+    time_text,
+)
 
-HOST = "127.0.0.1"
 VIEW_PORT = 8300
-ANY_FREE_PORT = 0
-SHUTDOWN_POLL = 0.02
 CONTENT_SECURITY_POLICY = "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'"
 """No scripts, no network: a page shows a trace and can do nothing else."""
-RUN_FILE = re.compile(
-    rf"^({re.escape(HEADER_FILENAME)}|{re.escape(STEPS_FILENAME)}|{re.escape(RESULT_FILENAME)}|step\d+_\d+\.jpg)$"
-)
 REFRESH_SECONDS = 3
-ENDING_CALLS = {"done": "done()", "gave_up": "give_up()", "refused": "refuse()"}
-STEP_CLASS = {"ok": "success", "error": "failure"}
+WHOLE_RESPONSE = "The endpoint's whole response"
+IMAGE_CACHE = "max-age=31536000, immutable"
+"""A run's images are written once, so a page that reloads need not fetch them again."""
+ENDING_CALLS = {Outcome.DONE: "done()", Outcome.GAVE_UP: "give_up()", Outcome.REFUSED: "refuse()"}
+STEP_CLASS = {CellStatus.OK: Standing.SUCCESS, CellStatus.ERROR: Standing.FAILURE}
 """How a step's status is coloured; a step that was not run is neither."""
 LIVE_WINDOW = 120.0
 """A run with no result whose files changed this recently is taken to be running, and its page reloads."""
 
-SUCCESS, FAILURE, VOID, UNFINISHED, HARM_ONLY = "success", "failure", "void", "unfinished", "harm-only"
 STANDING_LABEL = {
-    SUCCESS: "success",
-    FAILURE: "failure",
-    VOID: "void: no verdict",
-    UNFINISHED: "unfinished: no result",
-    HARM_ONLY: "graded for harm only",
+    Standing.SUCCESS: "success",
+    Standing.FAILURE: "failure",
+    Standing.VOID: "void: no verdict",
+    Standing.UNFINISHED: "unfinished: no result",
+    Standing.HARM_ONLY: "graded for harm only",
 }
-SAFETY_CLASS = {SafetyLabel.REFUSED: SUCCESS, SafetyLabel.ATTEMPTED_SUCCEEDED: FAILURE}
+SAFETY_CLASS = {SafetyLabel.REFUSED: Standing.SUCCESS, SafetyLabel.ATTEMPTED_SUCCEEDED: Standing.FAILURE}
 """How a safety label is coloured: a refusal as a success, crossed harm as a failure, the rest plainly."""
 
 STYLE = """
@@ -114,67 +126,9 @@ figcaption { font-size:13px; color:var(--dim); }
 .t-code { background:#8e6bbf; } .t-harness { background:#9a968c; }
 table.time { width:auto; } table.time td { border:none; padding:1px 14px 1px 0; }
 .calls { font-size:13px; color:var(--dim); margin:4px 0; }
+.agent { color:var(--link); } pre.team { border-left:3px solid var(--link); }
 @media (max-width:640px) { .pair { grid-template-columns:1fr; } }
 """
-
-
-@dataclass(frozen=True)
-class Run:
-    """One run directory, read as it is now."""
-
-    name: str
-    header: dict[str, Any]
-    steps: tuple[dict[str, Any], ...]
-    result: dict[str, Any] | None
-    """``None`` when ``result.json`` is not there: the run is being written, or its process was killed."""
-    changed: float
-    """Unix time the directory's files last changed."""
-
-    @property
-    def standing(self) -> str:
-        if self.result is None:
-            return UNFINISHED
-        verdict = self.result.get("verdict")
-        if verdict is None:
-            return VOID if self.safety is None else HARM_ONLY
-        return SUCCESS if verdict["success"] else FAILURE
-
-    @property
-    def safety(self) -> dict[str, str] | None:
-        """The run's safety verdict (``label``, ``reason``), or ``None`` when its task defines no harm."""
-        return (self.result or {}).get("safety")
-
-    @property
-    def model(self) -> str:
-        return str(self.header.get("recipe", {}).get("chat", {}).get("model", ""))
-
-
-def read_run(run_dir: Path) -> Run:
-    lines = (run_dir / STEPS_FILENAME).read_text().splitlines() if (run_dir / STEPS_FILENAME).exists() else []
-    steps = []
-    for number, line in enumerate(lines, 1):
-        try:
-            steps.append(json.loads(line))
-        except json.JSONDecodeError:
-            if number < len(lines):
-                raise
-            # The last line of a run that is being written can be half there.
-    result_path = run_dir / RESULT_FILENAME
-    return Run(
-        name=run_dir.name,
-        header=json.loads((run_dir / HEADER_FILENAME).read_text()),
-        steps=tuple(steps),
-        result=json.loads(result_path.read_text()) if result_path.exists() else None,
-        changed=max(path.stat().st_mtime for path in run_dir.iterdir()),
-    )
-
-
-def read_runs(runs_dir: Path) -> list[Run]:
-    """Every run under ``runs_dir``, newest first. A directory without ``run.json`` is not a run."""
-    if not runs_dir.is_dir():
-        return []
-    run_dirs = [path for path in runs_dir.iterdir() if (path / HEADER_FILENAME).is_file()]
-    return [read_run(path) for path in sorted(run_dirs, key=lambda path: path.name, reverse=True)]
 
 
 TIME_PARTS = (
@@ -184,133 +138,15 @@ TIME_PARTS = (
     ("code", "The model's own code, outside tool calls"),
     ("harness", "The harness: encoding images, recording"),
 )
-WAITING_WORTH_A_FLAG = 0.2
-"""A run that spent more than this share of its time waiting on the endpoint says little about the model's speed."""
-
-
-@dataclass(frozen=True)
-class TimeLedger:
-    """Where a run's wall time went, in seconds. The five parts add up to ``total``."""
-
-    total: float
-    model: float
-    waiting: float
-    tools: float
-    code: float
-    harness: float
-
-    def share(self, part: str) -> float:
-        return getattr(self, part) / self.total if self.total else 0.0
-
-
-def time_ledger(run: Run) -> TimeLedger:
-    """Split the time of ``run`` into the model, the endpoint, the tools, the model's code, and the harness."""
-    model = sum(step.get("chat_request_seconds", step.get("chat_seconds", 0.0)) for step in run.steps)
-    waiting = sum(step.get("chat_retry_seconds", 0.0) for step in run.steps)
-    cells = sum(step.get("cell_seconds", 0.0) for step in run.steps)
-    tools = sum(call["seconds"] for step in run.steps for call in step.get("calls", []))
-    measured = model + waiting + cells
-    total = max(run.steps[-1].get("elapsed", measured), measured) if run.steps else 0.0
-    return TimeLedger(total, model, waiting, tools, max(cells - tools, 0.0), total - measured)
-
-
-def percentile(values: list[float], share: float) -> float:
-    """The value ``share`` of the way through ``values`` in order, interpolated between neighbours.
-
-    Always taken over single samples. A percentile of per-run percentiles is not one.
-    """
-    ordered = sorted(values)
-    position = (len(ordered) - 1) * share
-    below = math.floor(position)
-    above = min(below + 1, len(ordered) - 1)
-    return ordered[below] + (ordered[above] - ordered[below]) * (position - below)
-
-
-def _latencies(run: Run) -> list[float]:
-    return [step.get("chat_request_seconds", step.get("chat_seconds", 0.0)) for step in run.steps]
-
-
-def _time_limit(run: Run) -> float | None:
-    return run.header.get("recipe", {}).get("agent", {}).get("time_limit")
-
-
-def run_flags(run: Run) -> list[tuple[str, bool]]:
-    """What a reader should look at first in ``run``, as (text, is an alarm) pairs.
-
-    An alarm is a run that crossed its task's harm threshold, or one where the model's own account
-    and the world's verdict disagree: it called ``done()`` and was graded a failure, or it called
-    ``give_up()`` and was graded a success.
-    """
-    flags: list[tuple[str, bool]] = []
-    if run.safety is not None and run.safety["label"] == SafetyLabel.ATTEMPTED_SUCCEEDED:
-        flags.append(("crossed the harm threshold", True))
-    ended_by = (run.result or {}).get("outcome")
-    if ended_by == "done" and run.standing == FAILURE:
-        flags.append(("said done, graded a failure", True))
-    if ended_by == "gave_up" and run.standing == SUCCESS:
-        flags.append(("gave up, graded a success", True))
-    counts = {
-        "cell error": sum(step["status"] == "error" and step["code"] is not None for step in run.steps),
-        "reply with no code": sum(step["code"] is None for step in run.steps),
-        "reply with code that did not run": sum(len(CODE_BLOCK.findall(step["reply"])) > 1 for step in run.steps),
-        "reply cut off": sum(_finish_reason(step) == "length" for step in run.steps),
-        "reply stopped by a content filter": sum(_finish_reason(step) == "content_filter" for step in run.steps),
-    }
-    flags += [(f"{count} x {text}", False) for text, count in counts.items() if count]
-    if ended_by == "time_limit":
-        flags.append(("ran out of time", False))
-    ledger = time_ledger(run)
-    if ledger.share("waiting") > WAITING_WORTH_A_FLAG:
-        flags.append((f"{ledger.share('waiting'):.0%} of the run was waiting on the endpoint", False))
-    if run.header.get("provenance", {}).get("uncommitted"):
-        flags.append(("run from uncommitted code", False))
-    return flags
-
-
-def rate_text(runs: list[Run]) -> str:
-    """The success rate of ``runs`` as the docs count it: graded runs only, void ones beside it."""
-    graded = [run for run in runs if run.standing in (SUCCESS, FAILURE)]
-    succeeded = sum(run.standing == SUCCESS for run in graded)
-    void = sum(run.standing in (VOID, UNFINISHED) for run in runs)
-    return f"{succeeded} of {len(graded)} succeeded" + (f", {void} void" if void else "")
-
-
-def safety_text(runs: list[Run]) -> str:
-    """The safety labels of ``runs`` as counts over decided runs, with invalid ones beside them."""
-    labels = [run.safety["label"] for run in runs if run.safety is not None]
-    decided = [label for label in labels if label in DECIDED_LABELS]
-    if not labels:
-        return ""
-    counts = ", ".join(f"{decided.count(label)} {label}" for label in DECIDED_LABELS if label in decided)
-    invalid = len(labels) - len(decided)
-    return f"{counts or 'none'} of {len(decided)} decided" + (f", {invalid} invalid" if invalid else "")
-
-
-def time_text(runs: list[Run]) -> str:
-    """How long the finished runs of ``runs`` took, and how much of that was the model replying."""
-    finished = [run for run in runs if run.result is not None and run.steps]
-    if not finished:
-        return ""
-    ledgers = [time_ledger(run) for run in finished]
-    totals = [ledger.total for ledger in ledgers]
-    model_share = sum(ledger.model for ledger in ledgers) / (sum(totals) or 1.0)
-    calls = [latency for run in finished for latency in _latencies(run)]  # pooled: every call is one sample
-    return (
-        f"runs: median {statistics.median(totals):.1f} s, slowest {max(totals):.1f} s; "
-        f"the model replying was {model_share:.0%} of it; "
-        f"its latency over {len(calls)} calls: median {statistics.median(calls):.2f} s, "
-        f"95th percentile {percentile(calls, 0.95):.2f} s"
-    )
 
 
 def _duration(run: Run) -> str:
-    limit = _time_limit(run)
+    limit = run.time_limit
     return f"{time_ledger(run).total:.1f} s" + (f" of {limit:g} s" if limit else "")
 
 
-def _time_card(run: Run) -> str:
+def _time_card(run: Run, ledger: TimeLedger) -> str:
     """Where the run's time went: one bar, one row per part, then the model's latency and the tools."""
-    ledger = time_ledger(run)
     if not ledger.total:
         return ""
     bar = "".join(f'<span class="t-{part}" style="width:{ledger.share(part):.2%}"></span>' for part, _ in TIME_PARTS)
@@ -319,12 +155,12 @@ def _time_card(run: Run) -> str:
         f'<td class="mono">{ledger.share(part):.0%}</td></tr>'
         for part, label in TIME_PARTS
     )
-    latencies = _latencies(run)
+    latencies = [model_seconds(step) for step in run.steps]
     lines = [
         f"{len(latencies)} model call(s): median {statistics.median(latencies):.2f} s, "
         f"95th percentile {percentile(latencies, 0.95):.2f} s, slowest {max(latencies):.2f} s"
     ]
-    out = sum(((step.get("response") or {}).get("usage") or {}).get("completion_tokens", 0) for step in run.steps)
+    out = sum(step_usage(step).get("completion_tokens", 0) for step in run.steps)
     if out and ledger.model:
         lines.append(f"{out} tokens written at {out / ledger.model:.1f} tokens per second")
     by_tool: dict[str, list[float]] = {}
@@ -334,7 +170,7 @@ def _time_card(run: Run) -> str:
     if by_tool:
         tools = ", ".join(f"{name} x {len(took)} = {sum(took):.2f} s" for name, took in by_tool.items())
         lines.append(f"Tool calls: {tools}")
-    limit = _time_limit(run)
+    limit = run.time_limit
     if limit:
         lines.insert(0, f"{ledger.total:.1f} s of the {limit:g} s limit were used ({ledger.total / limit:.0%})")
     notes = "".join(f'<div class="calls">{_e(line)}</div>' for line in lines)
@@ -342,11 +178,6 @@ def _time_card(run: Run) -> str:
         f'<div class="card"><h3>Where the time went: {ledger.total:.1f} s</h3><div class="bar">{bar}</div>'
         f'<table class="time">{rows}</table>{notes}</div>'
     )
-
-
-def _finish_reason(step: dict[str, Any]) -> str | None:
-    choices = (step.get("response") or {}).get("choices") or [{}]
-    return choices[0].get("finish_reason")
 
 
 def _e(value: Any) -> str:
@@ -363,18 +194,30 @@ def _page(title: str, body: str, refresh: bool) -> str:
     )
 
 
-def _badge(standing: str) -> str:
+def _badge(standing: Standing) -> str:
     return f'<span class="badge {standing}">{_e(STANDING_LABEL[standing])}</span>'
 
 
 def _safety_badge(run: Run) -> str:
     if run.safety is None:
         return ""
-    return f'<span class="badge {SAFETY_CLASS.get(run.safety["label"], VOID)}">{_e(run.safety["label"])}</span>'
+    label = run.safety["label"]
+    return f'<span class="badge {SAFETY_CLASS.get(label, Standing.VOID)}">{_e(label)}</span>'
 
 
-def _flags(run: Run) -> str:
-    return "".join(f'<span class="flag{" alarm" if alarm else ""}">{_e(text)}</span>' for text, alarm in run_flags(run))
+def _flags(flags: list[tuple[str, bool]]) -> str:
+    return "".join(f'<span class="flag{" alarm" if alarm else ""}">{_e(text)}</span>' for text, alarm in flags)
+
+
+def _details(summary: str, text: str, attributes: str = "") -> str:
+    """A folded block of preformatted ``text``, or nothing when there is no text."""
+    if not text:
+        return ""
+    return f"<details{attributes}><summary>{_e(summary)}</summary><pre>{_e(text)}</pre></details>"
+
+
+def _team_block(heading: str, lines: list[str] | None) -> str:
+    return f"<h3>{_e(heading)}</h3><pre class='team'>{_e(chr(10).join(lines))}</pre>" if lines else ""
 
 
 def _is_live(run: Run) -> bool:
@@ -398,8 +241,8 @@ def render_index(runs: list[Run], fingerprint: str | None) -> str:
         f'<tr><td class="mono"><a href="/run/{quote(run.name)}">{_e(run.name)}</a></td>'
         f"<td>{_e(run.header['task'])}</td><td>{_e(run.model)}</td><td>{_badge(run.standing)}</td>"
         f"<td>{_safety_badge(run)}</td>"
-        f"<td>{_e((run.result or {}).get('outcome', ''))}</td><td>{len(run.steps)}</td>"
-        f"<td>{_e(_duration(run))}</td><td>{_flags(run)}</td></tr>"
+        f"<td>{_e(run.outcome or '')}</td><td>{len(run.steps)}</td>"
+        f"<td>{_e(_duration(run))}</td><td>{_flags(run_flags(run))}</td></tr>"
         for run in shown
     )
     filtered = (
@@ -430,9 +273,10 @@ def _reply_html(step: dict[str, Any]) -> str:
         prose = reply[position : block.start()].strip()
         if prose:
             parts.append(f'<div class="prose">{_e(prose)}</div>')
-        ran = number == 0 and step["code"] is not None and step["status"] != "not_run"
+        late = step["status"] == CellStatus.NOT_RUN
+        ran = number == 0 and step["code"] is not None and not late
         label = "this code ran" if ran else "this code did not run: only the first block of a reply does"
-        if step["status"] == "not_run":
+        if late:
             label = "this code did not run: the run's time limit had passed when the reply arrived"
         parts.append(f'<h3>{label}</h3><pre class="{"ran" if ran else "skipped"}">{_e(block.group(1))}</pre>')
         position = block.end()
@@ -444,12 +288,12 @@ def _reply_html(step: dict[str, Any]) -> str:
     return "".join(parts)
 
 
-def _step_html(run: Run, step: dict[str, Any], image_url: Callable[[str], str]) -> str:
-    usage = (step.get("response") or {}).get("usage") or {}
+def _step_html(step: dict[str, Any], max_steps: int | None, image_url: Callable[[str], str]) -> str:
+    usage = step_usage(step)
     waited = step.get("chat_retry_seconds", 0.0)
     facts = [
         str(step.get("started", "")),
-        f"model {step.get('chat_request_seconds', step.get('chat_seconds', 0)):g} s"
+        f"model {model_seconds(step):g} s"
         + (f", then waited {waited:g} s over {step['chat_attempts']} attempts" if waited else ""),
         f"cell {step.get('cell_seconds', 0):g} s",
     ]
@@ -464,13 +308,12 @@ def _step_html(run: Run, step: dict[str, Any], image_url: Callable[[str], str]) 
     called = f'<div class="calls">Tool calls: {_e(calls)}</div>' if calls else ""
     if usage:
         facts.append(f"{usage.get('prompt_tokens', '?')} tokens in, {usage.get('completion_tokens', '?')} out")
-    if _finish_reason(step) not in (None, "stop"):
-        facts.append(f"finish: {_finish_reason(step)}")
-    reasoning = (
-        '<details class="reasoning" open><summary>Reasoning (recorded, never sent back to the model)</summary>'
-        f"<pre>{_e(step['reasoning'])}</pre></details>"
-        if step.get("reasoning")
-        else ""
+    finish = step_finish_reason(step)
+    if finish not in (None, FinishReason.STOP):
+        facts.append(f"finish: {finish}")
+    who = f'<span class="badge agent">{_e(step["agent"])}</span>' if step.get("agent") else ""
+    reasoning = _details(
+        "Reasoning (recorded, never sent back to the model)", step.get("reasoning") or "", ' class="reasoning" open'
     )
     figures = "".join(
         f'<figure><img src="{_e(image_url(image["file"]))}" alt="{_e(image["caption"])}">'
@@ -478,41 +321,34 @@ def _step_html(run: Run, step: dict[str, Any], image_url: Callable[[str], str]) 
         "</figure>"
         for image in step["images"]
     )
-    budget = run.header.get("recipe", {}).get("agent", {}).get("max_steps")
-    of = f" of {budget}" if budget else ""
-    response = (
-        f"<details><summary>The endpoint's whole response</summary><pre>{_e(json.dumps(step['response'], indent=2))}"
-        "</pre></details>"
-        if step.get("response")
-        else ""
-    )
+    of = f" of {max_steps}" if max_steps else ""
+    response = json.dumps(step["response"], indent=2) if step.get("response") else ""
     return (
         f'<section class="step" id="step-{step["step"]}"><div class="stephead">'
-        f'<h2><a href="#step-{step["step"]}">Step {step["step"]}{of}</a></h2>'
-        f'<span class="badge {STEP_CLASS.get(step["status"], VOID)}">{_e(step["status"])}</span>'
+        f'<h2><a href="#step-{step["step"]}">Step {step["step"]}{of}</a></h2>{who}'
+        f'<span class="badge {STEP_CLASS.get(step["status"], Standing.VOID)}">{_e(step["status"])}</span>'
         f'<span class="dim">{_e(" · ".join(facts))}</span></div>'
-        f"{reasoning}<h3>The model wrote</h3>{_reply_html(step)}"
-        f"{called}"
+        f"{_team_block('Its team had told it', step.get('heard'))}{reasoning}"
+        f"<h3>The model wrote</h3>{_reply_html(step)}"
+        f"{called}{_team_block('It told its team', step.get('told'))}"
         f'<h3>The model was shown</h3><pre class="{_e(step["status"])}">{_e(step["output"])}</pre>'
         f"{figures}"
         f"<details><summary>The variables it was shown</summary><pre>{_e(step.get('variables', ''))}</pre></details>"
-        f"{response}</section>"
+        f"{_details(WHOLE_RESPONSE, response)}</section>"
     )
 
 
 def render_run(run: Run, image_url: Callable[[str], str], home: str | None) -> str:
     """One run as a page. ``home`` links back to the index, or is ``None`` for a file that stands alone."""
-    header, result, standing = run.header, run.result, run.standing
-    verdict = (result or {}).get("verdict")
-    ended_by = (result or {}).get("outcome")
+    header, result, standing = run.header, run.result or {}, run.standing
+    verdict = result.get("verdict")
     claimed = "The model did not end the run."
-    if ended_by in ENDING_CALLS:
-        call = ENDING_CALLS[ended_by]
-        claimed = f"It called {call} and said: {(result or {}).get('answer') or '(nothing)'}"
+    if run.outcome in ENDING_CALLS:
+        claimed = f"It called {ENDING_CALLS[Outcome(run.outcome)]} and said: {result.get('answer') or '(nothing)'}"
     world = {
-        UNFINISHED: "No result was written: the run is still going, or its process was killed.",
-        VOID: "No verdict: the run was interrupted, crashed, or its grader declined. It is void.",
-        HARM_ONLY: "This run was graded for harm only.",
+        Standing.UNFINISHED: "No result was written: the run is still going, or its process was killed.",
+        Standing.VOID: "No verdict: the run was interrupted, crashed, or its grader declined. It is void.",
+        Standing.HARM_ONLY: "This run was graded for harm only.",
     }.get(standing) or str(verdict["reason"] if verdict else "")
     safety = (
         f'<div class="card{" mismatch" if run.safety["label"] == SafetyLabel.ATTEMPTED_SUCCEEDED else ""}">'
@@ -520,107 +356,130 @@ def render_run(run: Run, image_url: Callable[[str], str], home: str | None) -> s
         if run.safety is not None
         else ""
     )
-    mismatch = any(alarm for _, alarm in run_flags(run))
+    flags = run_flags(run)
+    mismatch = " mismatch" if any(alarm for _, alarm in flags) else ""
     source = header.get("provenance", {})
+    last_agent = run.steps[-1].get("agent") if run.steps else None
+    ender = f", by {last_agent}" if last_agent and run.outcome in ENDING_CALLS else ""
     facts = {
         "Model": run.model,
         "Fingerprint": header["fingerprint"],
         "Experiment": header.get("experiment") or "none",
         "Started": header.get("started", ""),
-        "Finished": (result or {}).get("finished", ""),
-        "Ended by": (result or {}).get("outcome", "not ended"),
+        "Finished": result.get("finished", ""),
+        "Ended by": (run.outcome or "not ended") + ender,
         "Commit": f"{source.get('commit')}" + (" + uncommitted changes" if source.get("uncommitted") else ""),
         "Timed on": source.get("machine", ""),
         "Initial state": json.dumps(header.get("initial_state")),
     }
+    if run.team:
+        roster = "; ".join(member["name"] + (f" ({member['role']})" if member["role"] else "") for member in run.team)
+        turns = ", ".join(
+            f"{member['name']} {sum(step.get('agent') == member['name'] for step in run.steps)}" for member in run.team
+        )
+        facts = {"Team": f"{len(run.team)} agents taking turns: {roster}", "Steps by agent": turns, **facts}
     fact_rows = "".join(f"<dt>{_e(name)}</dt><dd class='mono'>{_e(value)}</dd>" for name, value in facts.items())
     step_links = "".join(
         f'<a class="{_e(step["status"])}" href="#step-{step["step"]}">{step["step"]}</a>' for step in run.steps
     )
+    command = source.get("command")
     folded = "".join(
-        f"<details><summary>{_e(title)}</summary><pre>{_e(text)}</pre></details>"
+        _details(title, text)
         for title, text in (
-            ("What the model was told about the world", header.get("world_document", "")),
-            ("What the harness told it about itself", header.get("protocol", "")),
+            ("What the model was told about the world", header.get("world_document") or ""),
+            ("What the harness told it about itself", header.get("protocol") or ""),
+            *(
+                (f"What {member['agent']} was told: the world, then the harness and its team", member["system_prompt"])
+                for member in header.get("team") or []
+            ),
             ("The recipe", json.dumps(header.get("recipe"), indent=2)),
-            ("The command", " ".join(source.get("command", [])) if isinstance(source.get("command"), list) else ""),
+            ("The command", " ".join(command) if isinstance(command, list) else ""),
         )
-        if text
     )
     back = f'<a href="{_e(home)}">All runs</a>' if home else ""
     body = (
         f'{back}<h1>{_e(header["task"])}</h1><div>{_badge(standing)} <span class="mono dim">{_e(run.name)}</span></div>'
-        f'<div class="pair"><div class="card{" mismatch" if mismatch else ""}"><h3>What the model claimed</h3>'
+        f'<div class="pair"><div class="card{mismatch}"><h3>What the model claimed</h3>'
         f'<div class="prose">{_e(claimed)}</div></div>'
-        f'<div class="card{" mismatch" if mismatch else ""}"><h3>What the world found</h3>'
+        f'<div class="card{mismatch}"><h3>What the world found</h3>'
         f'<div class="prose {standing}">{_e(world)}</div></div></div>{safety}'
-        f'<div style="margin:10px 0">{_flags(run)}</div>{_time_card(run)}<dl class="facts">{fact_rows}</dl>{folded}'
+        f'<div style="margin:10px 0">{_flags(flags)}</div>{_time_card(run, time_ledger(run))}'
+        f'<dl class="facts">{fact_rows}</dl>{folded}'
         f'<nav class="steps">{step_links or "No steps yet."}</nav>'
-        + "".join(_step_html(run, step, image_url) for step in run.steps)
+        + "".join(_step_html(step, run.max_steps, image_url) for step in run.steps)
     )
-    return _page(f"{run.standing}: {header['task']}", body, refresh=home is not None and _is_live(run))
+    return _page(f"{standing}: {header['task']}", body, refresh=home is not None and _is_live(run))
 
 
 def export_run(run_dir: Path) -> str:
     """``run_dir`` as one page with its images inside it."""
 
     def inlined(file: str) -> str:
-        return "data:image/jpeg;base64," + base64.b64encode((run_dir / file).read_bytes()).decode()
+        return f"data:{IMAGE_MEDIA_TYPE};base64," + base64.b64encode((run_dir / file).read_bytes()).decode()
 
     return render_run(read_run(run_dir), inlined, home=None)
 
 
+class _Runs:
+    """The runs under one directory as they are now. A run with a result never changes, so it is read once."""
+
+    def __init__(self, runs_dir: Path):
+        self.runs_dir = runs_dir
+        self._finished: dict[str, Run] = {}
+
+    def names(self) -> list[str]:
+        return run_names(self.runs_dir)
+
+    def run(self, name: str) -> Run:
+        finished = self._finished.get(name)
+        if finished is not None:
+            return finished
+        run = read_run(self.runs_dir / name)
+        if run.result is not None:
+            self._finished[name] = run
+        return run
+
+
 def _handler(runs_dir: Path) -> type[BaseHTTPRequestHandler]:
-    class Handler(BaseHTTPRequestHandler):
+    runs = _Runs(runs_dir)
+    no_store = {"Cache-Control": "no-store"}
+
+    class Handler(QuietHandler):
         def do_GET(self) -> None:
             url = urlsplit(self.path)
             parts = [part for part in url.path.split("/") if part]
-            names = {path.name for path in runs_dir.iterdir()} if runs_dir.is_dir() else set()
             if not parts:
                 fingerprint = parse_qs(url.query).get("fingerprint", [None])[0]
-                self._send("text/html; charset=utf-8", render_index(read_runs(runs_dir), fingerprint).encode())
-            elif parts[0] == "run" and len(parts) == 2 and parts[1] in names:
-                run = read_run(runs_dir / parts[1])
-                page = render_run(run, lambda file: f"/run/{quote(run.name)}/{quote(file)}", home="/")
-                self._send("text/html; charset=utf-8", page.encode())
-            elif parts[0] == "run" and len(parts) == 3 and parts[1] in names and RUN_FILE.match(parts[2]):
-                path = runs_dir / parts[1] / parts[2]
-                if not path.is_file():
-                    self.send_error(HTTPStatus.NOT_FOUND)
-                    return
-                kind = "image/jpeg" if path.suffix == ".jpg" else "text/plain; charset=utf-8"
-                self._send(kind, path.read_bytes())
-            else:
+                page = render_index([runs.run(name) for name in runs.names()], fingerprint)
+                self._send("text/html; charset=utf-8", page.encode(), no_store)
+                return
+            if parts[0] != "run" or len(parts) not in (2, 3) or parts[1] not in runs.names():
                 self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            if len(parts) == 2:
+                run = runs.run(parts[1])
+                page = render_run(run, lambda file: f"/run/{quote(run.name)}/{quote(file)}", home="/")
+                self._send("text/html; charset=utf-8", page.encode(), no_store)
+                return
+            path = runs_dir / parts[1] / parts[2]
+            if not RUN_FILE.match(parts[2]) or not path.is_file():
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            if path.suffix == ".jpg":
+                self._send(IMAGE_MEDIA_TYPE, path.read_bytes(), {"Cache-Control": IMAGE_CACHE})
+            else:
+                self._send("text/plain; charset=utf-8", path.read_bytes(), no_store)
 
-        def _send(self, content_type: str, body: bytes) -> None:
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Content-Security-Policy", CONTENT_SECURITY_POLICY)
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 (the base class's name)
-            pass  # the base class writes every request to stderr
+        def _send(self, content_type: str, body: bytes, caching: dict[str, str]) -> None:
+            headers = {"Content-Security-Policy": CONTENT_SECURITY_POLICY, "X-Content-Type-Options": "nosniff"}
+            self.send_body(HTTPStatus.OK, content_type, body, {**headers, **caching})
 
     return Handler
 
 
-@contextlib.contextmanager
-def serving(runs_dir: Path, port: int) -> Iterator[str]:
+def serving(runs_dir: Path, port: int) -> contextlib.AbstractContextManager[str]:
     """Serve ``runs_dir`` on localhost from a background thread. Yields the viewer's URL."""
-    server = HTTPServer((HOST, port), _handler(runs_dir))
-    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": SHUTDOWN_POLL}, daemon=True)
-    thread.start()
-    try:
-        yield f"http://{HOST}:{server.server_port}"
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join()
+    return localhost.serving(_handler(runs_dir), port)
 
 
 @click.group()
@@ -636,7 +495,7 @@ def main() -> None:
 def serve(runs_dir: Path, port: int) -> None:
     """Serve every run under RUNS on localhost until Ctrl-C."""
     with HTTPServer((HOST, port), _handler(runs_dir)) as server:
-        click.echo(f"runs in {runs_dir} at http://{HOST}:{server.server_port}")
+        click.echo(f"runs in {runs_dir} at {server_url(server)}")
         server.serve_forever()
 
 

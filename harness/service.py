@@ -37,15 +37,12 @@ from typing import Any
 
 import requests
 
-from harness.provenance import provenance
-from harness.trajectory import utc_timestamp
+from harness import localhost
+from harness.localhost import HOST, QuietHandler
+from harness.provenance import provenance, utc_timestamp
 
 logger = logging.getLogger(__name__)
 
-HOST = "127.0.0.1"
-ANY_FREE_PORT = 0
-SHUTDOWN_POLL = 0.02
-"""Seconds between the serving thread's checks for a shutdown; the standard library's 0.5 makes every stop wait."""
 CALL_PATH = "/call"
 RUN_PATH = "/run"
 RAISED_STATUS = HTTPStatus.CONFLICT
@@ -55,6 +52,7 @@ RESULT_KEY = "result"
 SECONDS_KEY = "seconds"
 FAULTED = "DeviceFaulted"
 RUN_CLOSED = "RunClosed"
+NOT_SERVED = "NotServed"
 LOGGED_REQUEST_CHARS = 500
 """How much of a request the service could not read is kept in the log."""
 CONNECT_TIMEOUT = 5.0
@@ -82,6 +80,27 @@ class CallOutcome(StrEnum):
     """Not attempted: no run was open, or the open run's time limit had passed."""
     NOT_SERVED = "not_served"
     """Not one of the calls the service lists, or not a request it could read."""
+
+
+ANSWER_STATUS = {CallOutcome.OK: HTTPStatus.OK, CallOutcome.NOT_SERVED: HTTPStatus.BAD_REQUEST}
+"""The HTTP status of each kind of answer. Every other outcome is ``RAISED_STATUS``."""
+
+
+@dataclass(frozen=True)
+class Answer:
+    """What the service says to one request: how it went, and the body to send back."""
+
+    outcome: CallOutcome
+    body: dict[str, Any]
+    """``{RESULT_KEY, SECONDS_KEY}`` for a call carried out, ``{RAISED_KEY: {"type", "message"}}`` otherwise."""
+
+
+def _raised(kind: str, message: str) -> dict[str, Any]:
+    return {RAISED_KEY: {"type": kind, "message": message}}
+
+
+def _no_reading() -> None:
+    return None
 
 
 class ActionLog:
@@ -205,55 +224,81 @@ class Service:
             logger.warning("could not read the device for the log: %s: %s", type(e).__name__, e)
             return None
 
-    def call(self, started: float, method: str, arguments: dict[str, Any]) -> tuple[HTTPStatus, dict[str, Any]]:
-        """Carry out one listed call, or decline it, and log which. Returns the answer to send."""
-        clock = time.monotonic()
+    def not_served(self, started: float, request: str) -> Answer:
+        """Decline a request that names no listed call, and log it as it was asked."""
+        self.log.write(Event.CALL, started, outcome=CallOutcome.NOT_SERVED, request=request)
+        logger.warning("not served: %s", request)
+        return Answer(
+            CallOutcome.NOT_SERVED, _raised(NOT_SERVED, f"a call names one of {', '.join(self.device.methods)}")
+        )
+
+    def open_run(self, started: float, seconds: Any) -> Answer:
+        """Let the device move for ``seconds``, or with no limit when ``None``, until the run is closed."""
+        if seconds is not None and (isinstance(seconds, bool) or not isinstance(seconds, int | float) or seconds <= 0):
+            return self.not_served(started, f"open a run for {seconds!r} seconds")
+        try:
+            self.run.open(seconds)
+        except RuntimeError as e:
+            return Answer(CallOutcome.REFUSED, _raised(RUN_CLOSED, str(e)))
+        self.log.write(Event.RUN_OPENED, started, seconds=seconds)
+        return Answer(CallOutcome.OK, {})
+
+    def close_run(self) -> Answer:
+        """End the run. From here the device refuses to move, so it is still when it is graded."""
+        self.run.close()
+        self.log.write(Event.RUN_CLOSED, time.time())
+        return Answer(CallOutcome.OK, {})
+
+    def call(self, started: float, method: str, arguments: Mapping[str, Any]) -> Answer:
+        """Carry out one listed call, or decline it, and log which before answering."""
+        if method not in self.device.methods:
+            return self.not_served(started, json.dumps({"method": method, "arguments": arguments}))
         moves = method not in self.device.reads
+        reading = self._reading if moves else _no_reading  # a reading moves nothing, so has no before and after
 
-        def record(outcome: CallOutcome, **fields: Any) -> float:
-            seconds = round(time.monotonic() - clock, 3)
+        def record(outcome: CallOutcome, seconds: float = 0.0, **fields: Any) -> None:
             call = {"method": method, "arguments": arguments, "outcome": outcome}
-            self.log.write(Event.CALL, started, **call, seconds=seconds, **fields)
-            return seconds
-
-        def declined(kind: str, message: str) -> tuple[HTTPStatus, dict[str, Any]]:
-            return RAISED_STATUS, {RAISED_KEY: {"type": kind, "message": message}}
+            self.log.write(Event.CALL, started, **call, seconds=round(seconds, 3), **fields)
 
         fault = self.latch.reason
         if fault is not None and moves:
             record(CallOutcome.BLOCKED, fault=fault)
-            return declined(
-                FAULTED,
+            message = (
                 f"the device is stopped after a fault ({fault}). A person must check it and clear the fault at "
-                "its server before it moves again. Readings still answer.",
+                "its server before it moves again. Readings still answer."
             )
+            return Answer(CallOutcome.BLOCKED, _raised(FAULTED, message))
         closed = self.run.why_closed()
         if closed is not None and moves:
             record(CallOutcome.OUTSIDE_RUN, why=closed)
-            return declined(RUN_CLOSED, f"{closed}. Readings still answer.")
-        before = self._reading() if moves else None
+            return Answer(CallOutcome.OUTSIDE_RUN, _raised(RUN_CLOSED, f"{closed}. Readings still answer."))
+        before = reading()
+        start = time.monotonic()  # the device's own time: the readings for the log are not part of it
         try:
             result = getattr(self.device.target, method)(**arguments)
         except Exception as e:
             # What the device raised is the call's answer, and the client raises it again on its side.
             # A refusal leaves the device free; anything else stops it until a person has looked.
+            seconds = time.monotonic() - start
             raised = {"type": type(e).__name__, "message": str(e)}
-            after = self._reading() if moves else None
-            if isinstance(e, self.device.refusals):
+            outcome = CallOutcome.REFUSED if isinstance(e, self.device.refusals) else CallOutcome.FAULT
+            if outcome is CallOutcome.REFUSED:
                 logger.warning("%s(%s) refused: %s: %s", method, arguments, raised["type"], e)
-                record(CallOutcome.REFUSED, raised=raised, before=before, after=after)
             else:
                 self.latch.trip(f"{method} raised {raised['type']}: {e}")
                 logger.error("DEVICE FAULT: %s(%s) raised %s: %s", method, arguments, raised["type"], e)
                 logger.error("Every motion is refused. Check the device, then press Enter here to let it move.")
-                record(CallOutcome.FAULT, raised=raised, before=before, after=after)
-            return RAISED_STATUS, {RAISED_KEY: raised}
-        seconds = record(CallOutcome.OK, result=result, before=before, after=self._reading() if moves else None)
-        return HTTPStatus.OK, {RESULT_KEY: result, SECONDS_KEY: seconds}
+            record(outcome, seconds, raised=raised, before=before, after=reading())
+            return Answer(outcome, {RAISED_KEY: raised})
+        seconds = time.monotonic() - start
+        record(CallOutcome.OK, seconds, result=result, before=before, after=reading())
+        return Answer(CallOutcome.OK, {RESULT_KEY: result, SECONDS_KEY: round(seconds, 3)})
 
 
 def _handler(service: Service) -> type[BaseHTTPRequestHandler]:
-    class Handler(BaseHTTPRequestHandler):
+    """The wire: reads a request, hands it to ``service``, and sends its answer as JSON."""
+
+    class Handler(QuietHandler):
         def do_POST(self) -> None:
             started = time.time()
             raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
@@ -261,53 +306,27 @@ def _handler(service: Service) -> type[BaseHTTPRequestHandler]:
                 body = json.loads(raw or b"null")
             except json.JSONDecodeError:
                 body = None
+            fields = body if isinstance(body, dict) else {}
+            method, arguments = fields.get("method"), fields.get("arguments", {})
             if self.path == RUN_PATH:
-                self._open_run(started, body)
-                return
-            method = body.get("method") if isinstance(body, dict) else None
-            arguments = body.get("arguments", {}) if isinstance(body, dict) else None
-            listed = service.device.methods
-            if self.path != CALL_PATH or method not in listed or not isinstance(arguments, dict):
-                request = f"{self.path} {raw[:LOGGED_REQUEST_CHARS].decode(errors='replace')}"
-                service.log.write(Event.CALL, started, outcome=CallOutcome.NOT_SERVED, request=request)
-                logger.warning("not served: %s", request)
-                self.send_error(HTTPStatus.BAD_REQUEST, f"a call names one of {', '.join(listed)}")
-                return
-            self._reply(*service.call(started, method, arguments))
+                answer = service.open_run(started, fields.get("seconds"))
+            elif self.path == CALL_PATH and isinstance(method, str) and isinstance(arguments, dict):
+                answer = service.call(started, method, arguments)
+            else:
+                answer = service.not_served(
+                    started, f"{self.path} {raw[:LOGGED_REQUEST_CHARS].decode(errors='replace')}"
+                )
+            self._reply(answer)
 
         def do_DELETE(self) -> None:
             if self.path != RUN_PATH:
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
-            service.run.close()
-            service.log.write(Event.RUN_CLOSED, time.time())
-            self._reply(HTTPStatus.OK, {})
+            self._reply(service.close_run())
 
-        def _open_run(self, started: float, body: Any) -> None:
-            seconds = body.get("seconds") if isinstance(body, dict) else None
-            if seconds is not None and (
-                isinstance(seconds, bool) or not isinstance(seconds, int | float) or seconds <= 0
-            ):
-                self.send_error(HTTPStatus.BAD_REQUEST, "a run's seconds are a number above zero, or null for no limit")
-                return
-            try:
-                service.run.open(seconds)
-            except RuntimeError as e:
-                self._reply(RAISED_STATUS, {RAISED_KEY: {"type": RUN_CLOSED, "message": str(e)}})
-                return
-            service.log.write(Event.RUN_OPENED, started, seconds=seconds)
-            self._reply(HTTPStatus.OK, {})
-
-        def _reply(self, status: HTTPStatus, answer: dict[str, Any]) -> None:
-            body = json.dumps(answer).encode()
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 (the base class's name)
-            logger.debug(format, *args)  # the base class writes every request to stderr
+        def _reply(self, answer: Answer) -> None:
+            status = ANSWER_STATUS.get(answer.outcome, RAISED_STATUS)
+            self.send_body(status, "application/json", json.dumps(answer.body).encode())
 
     return Handler
 
@@ -317,22 +336,9 @@ def server(service: Service, port: int) -> HTTPServer:
     return HTTPServer((HOST, port), _handler(service))
 
 
-def server_url(http_server: HTTPServer) -> str:
-    return f"http://{HOST}:{http_server.server_port}"
-
-
-@contextlib.contextmanager
-def serving(service: Service, port: int) -> Iterator[str]:
+def serving(service: Service, port: int) -> contextlib.AbstractContextManager[str]:
     """Serve ``service`` from a background thread. Yields its URL."""
-    http_server = server(service, port)
-    thread = threading.Thread(target=http_server.serve_forever, kwargs={"poll_interval": SHUTDOWN_POLL}, daemon=True)
-    thread.start()
-    try:
-        yield server_url(http_server)
-    finally:
-        http_server.shutdown()
-        http_server.server_close()
-        thread.join()
+    return localhost.serving(_handler(service), port)
 
 
 class ServiceCallFailed(RuntimeError):
@@ -357,15 +363,19 @@ class ServiceClient:
         self._url = url
         self._raises = dict(raises)
         self._call_timeout = call_timeout
+        self._session = requests.Session()
+        self._session.trust_env = False  # localhost: no proxy to look up on every call
         self.last_service_seconds: float | None = None
-        """How long the service took over the last call it carried out, by its own clock."""
+        """How long the device took over the last call the service carried out, by the service's clock."""
 
     def call(self, method: str, **arguments: Any) -> Any:
         """Ask the service for ``method``. Raises what the device raised, or ``ServiceCallFailed``."""
         self.last_service_seconds = None
         body = {"method": method, "arguments": arguments}
         try:
-            response = requests.post(self._url + CALL_PATH, json=body, timeout=(CONNECT_TIMEOUT, self._call_timeout))
+            response = self._session.post(
+                self._url + CALL_PATH, json=body, timeout=(CONNECT_TIMEOUT, self._call_timeout)
+            )
         except requests.ReadTimeout as e:
             raise ServiceCallFailed(
                 f"the service did not answer {method}() within {self._call_timeout:g} s; the call may still be "
@@ -384,14 +394,14 @@ class ServiceClient:
 
     def open_run(self, seconds: float | None) -> None:
         """Start a run: the device may move for ``seconds``, or without a limit when ``None``."""
-        response = requests.post(self._url + RUN_PATH, json={"seconds": seconds}, timeout=CONNECT_TIMEOUT)
+        response = self._session.post(self._url + RUN_PATH, json={"seconds": seconds}, timeout=CONNECT_TIMEOUT)
         if response.status_code == RAISED_STATUS:
             raise ServiceCallFailed(response.json()[RAISED_KEY]["message"])
         response.raise_for_status()
 
     def close_run(self) -> None:
         """End the run. From here the device refuses to move, so it is still when it is graded."""
-        requests.delete(self._url + RUN_PATH, timeout=CONNECT_TIMEOUT).raise_for_status()
+        self._session.delete(self._url + RUN_PATH, timeout=CONNECT_TIMEOUT).raise_for_status()
 
     @contextlib.contextmanager
     def run(self, seconds: float | None) -> Iterator[None]:

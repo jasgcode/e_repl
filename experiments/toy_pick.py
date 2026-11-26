@@ -6,6 +6,7 @@
 ``--world service`` runs the shelf in its own process and gives the model a client of it.
 ``--time-limit SECONDS`` gives the run a wall-clock limit the model is told about, and
 ``--extra-latency SECONDS`` adds a delay to every reply, to see what speed is worth.
+``--agents N`` puts N equal agents on the task; they take turns and can tell each other things.
 
 Needs an API key for the endpoint (``--api-key`` or ``NVIDIA_API_KEY``). The run is written to
 ``runs/``. Exits 0 when the shelf's verdict is a success.
@@ -23,7 +24,7 @@ import numpy as np
 
 from harness.chat import NIM_BASE_URL, ChatModel, OpenAIChat, SlowedChat
 from harness.docs import DOCS_DIR, OPEN, experiment_status
-from harness.loop import AgentConfig, run_agent
+from harness.loop import AgentConfig, run_agent, run_team, swarm
 from harness.repl import Repl, ReplConfig
 from harness.trajectory import DirectoryRecorder
 from project.shelf_client import ShelfClient
@@ -55,6 +56,7 @@ class World(StrEnum):
     help="Where the shelf runs: in the harness's process, or as a service the model holds a client of.",
 )
 @click.option("--max-steps", type=int, default=8, show_default=True)
+@click.option("--agents", type=click.IntRange(min=1), default=1, show_default=True, help="Agents taking turns.")
 @click.option("--time-limit", type=float, help="Seconds of wall clock the run may take. The model is told.")
 @click.option("--extra-latency", type=float, default=0.0, show_default=True, help="Seconds added to every reply.")
 @click.option("--experiment", help="Slug of the open docs/experiments file this run answers.")
@@ -67,6 +69,7 @@ def main(
     seed: int,
     world_name: str,
     max_steps: int,
+    agents: int,
     time_limit: float | None,
     extra_latency: float,
     experiment: str | None,
@@ -87,17 +90,14 @@ def main(
         else:
             local = shuffled_shelf(seed)
             shelf, grade = local, partial(pick_verdict, local, color)
-        result = run_agent(
-            task=f"Pick the {color} box.",
-            repl=Repl({"shelf": shelf, "np": np}, ReplConfig()),
-            chat=chat,
-            config=AgentConfig(instructions=INSTRUCTIONS, max_steps=max_steps, time_limit=time_limit),
-            recorder=recorder,
-            grade=grade,
-            initial_state={"seed": seed, "world": world},
-            judge_harm=None,
-            experiment=experiment,
-        )
+        task, tools = f"Pick the {color} box.", {"shelf": shelf, "np": np}
+        config = AgentConfig(instructions=INSTRUCTIONS, max_steps=max_steps, time_limit=time_limit)
+        state = {"seed": seed, "world": world}
+        if agents == 1:
+            result = run_agent(task, Repl(tools, ReplConfig()), chat, config, recorder, grade, state, None, experiment)
+        else:
+            team = swarm(agents, chat, tools)  # equal agents on one model, sharing the one shelf
+            result = run_team(task, team, ReplConfig(), config, recorder, grade, state, None, experiment)
     verdict = result.verdict
     assert verdict is not None  # both shelf graders always judge
     click.echo(f"{result.outcome}: {result.answer!r}; {verdict.reason}; {recorder.run_dir}")

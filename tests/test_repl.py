@@ -1,14 +1,17 @@
 """The REPL: what a cell's observation holds, and what survives between cells."""
 
+import gc
 import io
 import signal
+import weakref
 
 import numpy as np
 import pytest
 from PIL import Image
 
 from harness.images import ImageSettings
-from harness.repl import CellStatus, Ending, Repl, ReplConfig, describe_tools, truncate
+from harness.outcomes import CellStatus, Ending
+from harness.repl import Repl, ReplConfig, describe_tools, truncate
 
 
 def _repl(tools=None, config: ReplConfig | None = None) -> Repl:
@@ -228,3 +231,19 @@ def test_tools_are_described_by_signature_and_first_docstring_line():
         "- ask(prompt: str) -> str: Ask a sub-model.",
         "- np: module numpy",
     ]
+
+
+def test_a_tool_held_by_several_repls_is_wrapped_once_and_keeps_none_of_them_alive():
+    class Lamp:
+        def switch(self) -> None:
+            """Switch the lamp."""
+
+    lamp = Lamp()
+    first = _repl({"lamp": lamp})
+    second = _repl({"light": lamp})
+    assert lamp.switch.__wrapped__.__func__ is Lamp.switch  # not a wrapper around the first REPL's wrapper
+    gone = weakref.ref(first)
+    del first
+    gc.collect()
+    assert gone() is None
+    assert [call.name for call in second.run("light.switch()").calls] == ["light.switch"]

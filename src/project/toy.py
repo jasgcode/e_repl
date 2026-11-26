@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from harness.records import Verdict
+from harness.outcomes import Verdict
 
 BOX_SIDE = 40
 """Pixels per box in ``Shelf.photo``."""
